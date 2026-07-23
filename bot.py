@@ -16,9 +16,11 @@ Setup:
 
 import os
 import re
+import threading
 import logging
 import requests
 from dotenv import load_dotenv
+from flask import Flask
 from telegram import Update, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -30,6 +32,25 @@ from telegram.ext import (
 )
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Keep-alive web server (Render's free tier requires the service to listen
+# on a port and respond to HTTP requests; this tiny Flask app does just
+# that. An external pinger like UptimeRobot should hit this URL every ~5
+# minutes to stop Render from putting the service to sleep.)
+# ---------------------------------------------------------------------------
+
+keep_alive_app = Flask(__name__)
+
+
+@keep_alive_app.route("/")
+def health_check():
+    return "Movie Announcer Bot is running."
+
+
+def run_keep_alive_server():
+    port = int(os.environ.get("PORT", 10000))
+    keep_alive_app.run(host="0.0.0.0", port=port)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
@@ -213,6 +234,10 @@ def main():
         raise SystemExit("BOT_TOKEN is not set. Check your .env file.")
     if not TMDB_API_KEY:
         logger.warning("TMDB_API_KEY not set — cover/lookup features will be disabled.")
+
+    # Start the keep-alive web server in the background so Render sees this
+    # as a live web service and keeps it on the free tier.
+    threading.Thread(target=run_keep_alive_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
