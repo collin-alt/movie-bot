@@ -59,6 +59,18 @@ GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")  # optional: restrict to one group
 TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/multi"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 
+# Posted instead of the poster/synopsis whenever a movie can't be matched
+# on TMDB, so the audience still sees something clean instead of the
+# original promo/spam caption from the source channel.
+FALLBACK_CAPTION = (
+    "🎬✨ TRANSLATED MOVIES™️ ✨🎬\n\n"
+    "🍿 We deliver all your favorite TRANSLATED movies & shows, straight to "
+    "this group — fresh uploads added regularly! 🔥📽️\n\n"
+    "✈️ Telegram: @collyni | @wilber256\n"
+    "🟢 WhatsApp: 0744546518 | 0775716867\n\n"
+    "🌟 Stay tuned, more coming soon! 🚀"
+)
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -78,6 +90,7 @@ JUNK_PATTERNS = [
     r"\b(aac|ac3|dts|5\.1|7\.1)\b",
     r"\b(yify|yts|rarbg|galaxyrg|evo|ntb|ethel)\b",
     r"\bvj\s+\w+\b",  # strip translator/VJ credit tags, e.g. "Vj Junior"
+    r"#\w+",  # strip hashtags, e.g. "#SCI_FI"
     r"\[.*?\]",
     r"\(.*?\)",
 ]
@@ -86,11 +99,20 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm"}
 
 
 def clean_title(filename: str) -> tuple[str, str | None]:
-    """Extract a probable (title, year) pair from a release filename."""
-    name, _ext = os.path.splitext(filename)
+    """Extract a probable (title, year) pair from a release filename or caption."""
+    # Only look at the first non-empty line. Multi-line captions from
+    # source channels are almost always: [title line] + [promo/spam block].
+    first_line = next((ln for ln in filename.splitlines() if ln.strip()), filename)
+    name, _ext = os.path.splitext(first_line)
 
     # Replace separators with spaces
     name = re.sub(r"[._]", " ", name)
+
+    # Cut off genre/rating tags that follow a bullet-style separator,
+    # e.g. "Mortal Engines 2018 ‧ Action/Sci-fi" -> stop before "‧"
+    sep_match = re.search(r"[‧•·|]", name)
+    if sep_match:
+        name = name[: sep_match.start()]
 
     # Pull out a year if present (helps TMDB disambiguate)
     year_match = re.search(r"\b(19\d{2}|20\d{2})\b", name)
@@ -181,51 +203,91 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not file_obj:
         return
 
-    filename = getattr(file_obj, "file_name", None) or (message.caption or "")
-    if not filename:
+    filename = getattr(file_obj, "file_name", None) or ""
+    caption_text = message.caption or ""
+
+    # Skip non-video documents (e.g. subtitles, nfo files) -- only check
+    # this when we actually have a filename with an extension to judge.
+    if filename:
+        ext = os.path.splitext(filename)[1].lower()
+        if message.document and ext not in VIDEO_EXTENSIONS:
+            return
+
+    if not filename and not caption_text:
         return
 
-    # Skip non-video documents (e.g. subtitles, nfo files)
-    ext = os.path.splitext(filename)[1].lower()
-    if message.document and ext not in VIDEO_EXTENSIONS:
-        return
+    meta = None
+    title = year = None
 
-    title, year = clean_title(filename)
+    # Try the actual filename first...
+    if filename:
+        title, year = clean_title(filename)
+        if title:
+            logger.info("Trying filename-derived title: %r year=%r", title, year)
+            meta = search_tmdb(title, year)
+
+    # ...then fall back to the caption if that didn't find anything. This
+    # matters a lot for groups where the real file has a generic/random
+    # name (e.g. "VID2024.mp4") but the actual title is written in the
+    # caption instead.
+    if not meta and caption_text:
+        cap_title, cap_year = clean_title(caption_text)
+        if cap_title and cap_title != title:
+            logger.info("Trying caption-derived title: %r year=%r", cap_title, cap_year)
+            meta = search_tmdb(cap_title, cap_year)
+            if meta:
+                title, year = cap_title, cap_year
+
     if not title:
         return
 
-    logger.info("Detected upload: filename=%r -> title=%r year=%r", filename, title, year)
-
-    meta = search_tmdb(title, year)
     if not meta:
-        logger.info("No TMDB match found for %r", title)
-        return
+        logger.info("No TMDB match found for %r (filename=%r, caption=%r)", title, filename, caption_text)
 
-    caption, poster_url = format_announcement(meta)
     thread_id = message.message_thread_id  # keeps it in the same topic, if any
 
+    # Drop the promo/spam block that source channels often tack onto
+    # captions (join-channel ads, prices, contact info, links). Keep
+    # only the first line, which is normally the actual title text.
+    original_caption = None
+    if message.caption:
+        first_line = next(
+            (ln.strip() for ln in message.caption.splitlines() if ln.strip()),
+            None,
+        )
+        original_caption = first_line or None
+
     try:
-        # 1. Post the cover + info FIRST
-        if poster_url:
-            await context.bot.send_photo(
-                chat_id=message.chat_id,
-                photo=poster_url,
-                caption=caption,
-                parse_mode=ParseMode.MARKDOWN,
-                message_thread_id=thread_id,
-            )
+        # 1. Post the cover + info FIRST, if we found a match. If not, we
+        #    still clean up the post below so the audience never sees the
+        #    promo spam, just without the poster/synopsis on top.
+        if meta:
+            info_caption, poster_url = format_announcement(meta)
+            if poster_url:
+                await context.bot.send_photo(
+                    chat_id=message.chat_id,
+                    photo=poster_url,
+                    caption=info_caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                    message_thread_id=thread_id,
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=message.chat_id,
+                    text=info_caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                    message_thread_id=thread_id,
+                )
         else:
             await context.bot.send_message(
                 chat_id=message.chat_id,
-                text=caption,
-                parse_mode=ParseMode.MARKDOWN,
+                text=FALLBACK_CAPTION,
                 message_thread_id=thread_id,
             )
 
-        # 2. Re-post the actual video/file right below the announcement.
-        #    Reusing the file_id means Telegram just re-links the existing
-        #    file — no re-uploading of the actual video bytes.
-        original_caption = message.caption or None
+        # 2. Re-post the actual video/file (with the cleaned caption) right
+        #    below the announcement. Reusing the file_id means Telegram
+        #    just re-links the existing file — no re-uploading of bytes.
         if message.video:
             await context.bot.send_video(
                 chat_id=message.chat_id,
