@@ -77,6 +77,7 @@ JUNK_PATTERNS = [
     r"\b(x264|x265|h264|h265|hevc|avc)\b",
     r"\b(aac|ac3|dts|5\.1|7\.1)\b",
     r"\b(yify|yts|rarbg|galaxyrg|evo|ntb|ethel)\b",
+    r"\bvj\s+\w+\b",  # strip translator/VJ credit tags, e.g. "Vj Junior"
     r"\[.*?\]",
     r"\(.*?\)",
 ]
@@ -114,20 +115,28 @@ def clean_title(filename: str) -> tuple[str, str | None]:
 def search_tmdb(title: str, year: str | None = None) -> dict | None:
     if not TMDB_API_KEY:
         return None
-    params = {"api_key": TMDB_API_KEY, "query": title, "include_adult": "false"}
-    if year:
-        params["year"] = year
-    try:
-        resp = requests.get(TMDB_SEARCH_URL, params=params, timeout=10)
-        resp.raise_for_status()
-        results = resp.json().get("results", [])
-    except requests.RequestException as e:
-        logger.warning("TMDB lookup failed: %s", e)
-        return None
 
-    # Prefer movie/tv results, ignore people
-    results = [r for r in results if r.get("media_type") in ("movie", "tv")]
-    return results[0] if results else None
+    def _query(with_year: bool) -> dict | None:
+        params = {"api_key": TMDB_API_KEY, "query": title, "include_adult": "false"}
+        if with_year and year:
+            params["year"] = year
+        try:
+            resp = requests.get(TMDB_SEARCH_URL, params=params, timeout=10)
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+        except requests.RequestException as e:
+            logger.warning("TMDB lookup failed: %s", e)
+            return None
+        results = [r for r in results if r.get("media_type") in ("movie", "tv")]
+        return results[0] if results else None
+
+    # Try with the year first (more precise), then fall back without it in
+    # case the number we extracted wasn't actually a release year.
+    result = _query(with_year=True)
+    if not result and year:
+        logger.info("No match with year=%s, retrying without year filter", year)
+        result = _query(with_year=False)
+    return result
 
 
 def format_announcement(meta: dict) -> tuple[str, str | None]:
