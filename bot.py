@@ -117,6 +117,18 @@ JUNK_PATTERNS = [
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm"}
 
 
+def extract_vj_credit(text: str) -> str | None:
+    """Pull out a 'Vj Name' translator credit before it gets stripped out
+    for title matching, so it can be preserved in the posted caption."""
+    if not text:
+        return None
+    first_line = next((ln for ln in text.splitlines() if ln.strip()), text)
+    match = re.search(r"\bvj\s+([a-zA-Z][\w'-]*(?:\s+[a-zA-Z][\w'-]*)?)", first_line, re.IGNORECASE)
+    if not match:
+        return None
+    return "Vj " + match.group(1).title()
+
+
 def clean_title(filename: str) -> tuple[str, str | None]:
     """Extract a probable (title, year) pair from a release filename or caption."""
     # Only look at the first non-empty line. Multi-line captions from
@@ -268,6 +280,8 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not filename and not caption_text:
         return
 
+    vj_credit = extract_vj_credit(caption_text) or extract_vj_credit(filename)
+
     meta = None
     title = year = None
 
@@ -316,6 +330,8 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         already_posted = _was_recently_posted(message.chat_id, thread_id, title)
         if meta and not already_posted:
             info_caption, poster_url = format_announcement(meta)
+            if vj_credit:
+                info_caption += f"\n\n🎙️ Translated by: {vj_credit}"
             if poster_url:
                 await context.bot.send_photo(
                     chat_id=message.chat_id,
@@ -333,9 +349,12 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             _mark_posted(message.chat_id, thread_id, title)
         elif not meta and not already_posted:
+            bio_text = FALLBACK_CAPTION
+            if vj_credit:
+                bio_text += f"\n\n🎙️ Translated by: {vj_credit}"
             await context.bot.send_message(
                 chat_id=message.chat_id,
-                text=FALLBACK_CAPTION,
+                text=bio_text,
                 message_thread_id=thread_id,
             )
             _mark_posted(message.chat_id, thread_id, title)
