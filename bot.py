@@ -145,6 +145,12 @@ def clean_title(filename: str) -> tuple[str, str | None]:
     # split-up uploads of the same movie all resolve to the same title.
     name = re.sub(r"\b(part|pt|cd|disc)\.?\s*\d+\b", "", name, flags=re.IGNORECASE)
 
+    # Strip episode/season numbering (Episode 3, Ep03, S01E02, Season 2)
+    # so multiple episodes of the same show collapse to one title too.
+    name = re.sub(r"\bs\d{1,2}e\d{1,3}\b", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\b(episode|ep)\.?\s*\d+\b", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\bseason\s*\d+\b", "", name, flags=re.IGNORECASE)
+
     # Strip known junk tags
     for pattern in JUNK_PATTERNS:
         name = re.sub(pattern, "", name, flags=re.IGNORECASE)
@@ -304,10 +310,10 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         original_caption = first_line or None
 
     try:
-        # 1. Post the cover + info FIRST, if we found a match and haven't
-        #    already posted this title in this chat/topic (avoids reposting
-        #    the same cover for Part 2, CD2, etc. of the same movie).
-        already_posted = meta and _was_recently_posted(message.chat_id, thread_id, title)
+        # 1. Post the cover + info FIRST (or the fallback bio if no match),
+        #    but only if we haven't already posted for this exact title in
+        #    this chat/topic — avoids repeating it for every episode/part.
+        already_posted = _was_recently_posted(message.chat_id, thread_id, title)
         if meta and not already_posted:
             info_caption, poster_url = format_announcement(meta)
             if poster_url:
@@ -326,12 +332,13 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message_thread_id=thread_id,
                 )
             _mark_posted(message.chat_id, thread_id, title)
-        elif not meta:
+        elif not meta and not already_posted:
             await context.bot.send_message(
                 chat_id=message.chat_id,
                 text=FALLBACK_CAPTION,
                 message_thread_id=thread_id,
             )
+            _mark_posted(message.chat_id, thread_id, title)
 
         # 2. Re-post the actual video/file (with the cleaned caption) right
         #    below the announcement. Reusing the file_id means Telegram
