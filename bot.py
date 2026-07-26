@@ -127,6 +127,16 @@ def _mark_posted(chat_id: int, thread_id: int | None, meta: dict | None, title: 
 def _was_recently_posted(chat_id: int, thread_id: int | None, meta: dict | None, title: str) -> bool:
     return any(key in _recently_posted for key in _dedup_keys(chat_id, thread_id, meta, title))
 
+
+def _next_episode_number(chat_id: int, thread_id: int | None, title: str) -> int:
+    """Returns 1 for the first upload of this title in this chat/topic, 2
+    for the next, and so on — used to number episodes/parts in order."""
+    key = f"{chat_id}:{thread_id}:count:{title.strip().lower()}"
+    count = _recently_posted.get(key, 0) + 1
+    _recently_posted[key] = count
+    _save_recently_posted()
+    return count
+
 # ---------------------------------------------------------------------------
 # Title cleanup
 # ---------------------------------------------------------------------------
@@ -390,9 +400,16 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         #    the VJ credit attached here, right under the video itself)
         #    below the announcement. Reusing the file_id means Telegram
         #    just re-links the existing file — no re-uploading of bytes.
-        video_caption = original_caption
+        # 2. Re-post the actual video/file, labeled "Title N" (in upload
+        #    order) with the VJ credit attached here, right under the
+        #    video itself, below the announcement. Reusing the file_id
+        #    means Telegram just re-links the existing file — no
+        #    re-uploading of bytes.
+        display_title = (meta.get("title") or meta.get("name")) if meta else title
+        episode_number = _next_episode_number(message.chat_id, thread_id, title)
+        video_caption = f"{display_title} {episode_number}"
         if vj_credit:
-            video_caption = f"{original_caption}\n\n🎙️ {vj_credit}" if original_caption else vj_credit
+            video_caption += f"\n\n🎙️ {vj_credit}"
 
         if message.video:
             await context.bot.send_video(
