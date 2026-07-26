@@ -182,7 +182,11 @@ def clean_title(filename: str) -> tuple[str, str | None]:
     # Only look at the first non-empty line. Multi-line captions from
     # source channels are almost always: [title line] + [promo/spam block].
     first_line = next((ln for ln in filename.splitlines() if ln.strip()), filename)
-    name, _ext = os.path.splitext(first_line)
+
+    # Strip a real video file extension only (avoid os.path.splitext here —
+    # it would wrongly treat something like "...VJ JR.2026" as if ".2026"
+    # were the file extension and silently eat the year).
+    name = re.sub(r"\.(mp4|mkv|avi|mov|m4v|webm)$", "", first_line, flags=re.IGNORECASE)
 
     # Replace separators with spaces
     name = re.sub(r"[._]", " ", name)
@@ -205,9 +209,12 @@ def clean_title(filename: str) -> tuple[str, str | None]:
     # split-up uploads of the same movie all resolve to the same title.
     name = re.sub(r"\b(part|pt|cd|disc)\.?\s*\d+\b", "", name, flags=re.IGNORECASE)
 
-    # Strip episode/season numbering (Episode 3, Ep03, S01E02, Season 2)
-    # so multiple episodes of the same show collapse to one title too.
-    name = re.sub(r"\bs\d{1,2}e\d{1,3}\b", "", name, flags=re.IGNORECASE)
+    # Strip episode/season numbering (Episode 3, Ep03, S01E02, S01.E02,
+    # Season 2) so multiple episodes of the same show collapse to one
+    # title. Allow an optional space between the season and episode
+    # numbers since "S01.E01" becomes "S01 E01" after dots are converted
+    # to spaces above.
+    name = re.sub(r"\bs\d{1,2}\s*e\d{1,3}\b", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\b(episode|ep)\.?\s*\d+\b", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\bseason\s*\d+\b", "", name, flags=re.IGNORECASE)
 
