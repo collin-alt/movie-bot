@@ -225,7 +225,7 @@ def search_tmdb(title: str, year: str | None = None) -> dict | None:
     return result
 
 
-def format_announcement(meta: dict) -> tuple[str, str | None]:
+def format_announcement(meta: dict, vj_credit: str | None = None) -> tuple[str, str | None]:
     """Return (caption, poster_url) for a TMDB result."""
     media_type = meta.get("media_type")
     title = meta.get("title") or meta.get("name") or "Unknown Title"
@@ -238,10 +238,11 @@ def format_announcement(meta: dict) -> tuple[str, str | None]:
 
     kind = "🎬 Movie" if media_type == "movie" else "📺 TV Show"
     rating_line = f"⭐ {rating:.1f}/10\n" if rating else ""
+    title_line = f"{title} {vj_credit}" if vj_credit else title
 
     caption = (
         f"{kind} • New Upload!\n\n"
-        f"*{title}* ({year})\n"
+        f"*{title_line}* ({year})\n"
         f"{rating_line}\n"
         f"{overview}"
     )
@@ -329,9 +330,7 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         #    this chat/topic — avoids repeating it for every episode/part.
         already_posted = _was_recently_posted(message.chat_id, thread_id, title)
         if meta and not already_posted:
-            info_caption, poster_url = format_announcement(meta)
-            if vj_credit:
-                info_caption += f"\n\n🎙️ Translated by: {vj_credit}"
+            info_caption, poster_url = format_announcement(meta, vj_credit)
             if poster_url:
                 await context.bot.send_photo(
                     chat_id=message.chat_id,
