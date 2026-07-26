@@ -18,6 +18,7 @@ import os
 import re
 import threading
 import logging
+import difflib
 import requests
 from dotenv import load_dotenv
 from flask import Flask
@@ -77,6 +78,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Tracks (chat_id, thread_id, normalized_title) that already got a cover
+# posted, so multi-part uploads (Part 1, Part 2, CD1, CD2...) of the same
+# movie only get the poster/info once. This resets if the bot restarts —
+# fine in practice since parts are almost always uploaded close together.
+_recently_posted: dict[tuple, None] = {}
+_RECENT_LIMIT = 500  # cap memory usage; oldest entries drop off first
+
+
+def _mark_posted(chat_id: int, thread_id: int | None, title: str) -> None:
+    key = (chat_id, thread_id, title.strip().lower())
+    _recently_posted[key] = None
+    if len(_recently_posted) > _RECENT_LIMIT:
+        _recently_posted.pop(next(iter(_recently_posted)))
+
+
+def _was_recently_posted(chat_id: int, thread_id: int | None, title: str) -> bool:
+    return (chat_id, thread_id, title.strip().lower()) in _recently_posted
+
 # ---------------------------------------------------------------------------
 # Title cleanup
 # ---------------------------------------------------------------------------
@@ -122,6 +141,10 @@ def clean_title(filename: str) -> tuple[str, str | None]:
     if year_match:
         name = name[: year_match.start()]
 
+    # Strip multi-part indicators (Part 1, Pt2, CD1, Disc 2, etc.) so that
+    # split-up uploads of the same movie all resolve to the same title.
+    name = re.sub(r"\b(part|pt|cd|disc)\.?\s*\d+\b", "", name, flags=re.IGNORECASE)
+
     # Strip known junk tags
     for pattern in JUNK_PATTERNS:
         name = re.sub(pattern, "", name, flags=re.IGNORECASE)
@@ -138,7 +161,7 @@ def search_tmdb(title: str, year: str | None = None) -> dict | None:
     if not TMDB_API_KEY:
         return None
 
-    def _query(with_year: bool) -> dict | None:
+    def _query(with_year: bool) -> list[dict]:
         params = {"api_key": TMDB_API_KEY, "query": title, "include_adult": "false"}
         if with_year and year:
             params["year"] = year
@@ -148,16 +171,39 @@ def search_tmdb(title: str, year: str | None = None) -> dict | None:
             results = resp.json().get("results", [])
         except requests.RequestException as e:
             logger.warning("TMDB lookup failed: %s", e)
+            return []
+        return [r for r in results if r.get("media_type") in ("movie", "tv")]
+
+    def _best_match(results: list[dict]) -> dict | None:
+        if not results:
             return None
-        results = [r for r in results if r.get("media_type") in ("movie", "tv")]
-        return results[0] if results else None
+        query_norm = title.strip().lower()
+
+        def score(r: dict) -> float:
+            name = (r.get("title") or r.get("name") or "").strip().lower()
+            similarity = difflib.SequenceMatcher(None, name, query_norm).ratio()
+            r_year = (r.get("release_date") or r.get("first_air_date") or "")[:4]
+            year_bonus = 0.3 if (year and r_year == year) else 0.0
+            popularity_bonus = min(r.get("popularity", 0) or 0, 50) / 500
+            return similarity + year_bonus + popularity_bonus
+
+        ranked = sorted(results, key=score, reverse=True)
+        best = ranked[0]
+        # Reject weak matches entirely rather than posting a probably-wrong
+        # poster — e.g. a short/generic title colliding with an unrelated
+        # show that happens to share the same words.
+        best_name = (best.get("title") or best.get("name") or "").strip().lower()
+        similarity = difflib.SequenceMatcher(None, best_name, query_norm).ratio()
+        if similarity < 0.6:
+            return None
+        return best
 
     # Try with the year first (more precise), then fall back without it in
     # case the number we extracted wasn't actually a release year.
-    result = _query(with_year=True)
+    result = _best_match(_query(with_year=True))
     if not result and year:
-        logger.info("No match with year=%s, retrying without year filter", year)
-        result = _query(with_year=False)
+        logger.info("No confident match with year=%s, retrying without year filter", year)
+        result = _best_match(_query(with_year=False))
     return result
 
 
@@ -258,10 +304,11 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         original_caption = first_line or None
 
     try:
-        # 1. Post the cover + info FIRST, if we found a match. If not, we
-        #    still clean up the post below so the audience never sees the
-        #    promo spam, just without the poster/synopsis on top.
-        if meta:
+        # 1. Post the cover + info FIRST, if we found a match and haven't
+        #    already posted this title in this chat/topic (avoids reposting
+        #    the same cover for Part 2, CD2, etc. of the same movie).
+        already_posted = meta and _was_recently_posted(message.chat_id, thread_id, title)
+        if meta and not already_posted:
             info_caption, poster_url = format_announcement(meta)
             if poster_url:
                 await context.bot.send_photo(
@@ -278,7 +325,8 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.MARKDOWN,
                     message_thread_id=thread_id,
                 )
-        else:
+            _mark_posted(message.chat_id, thread_id, title)
+        elif not meta:
             await context.bot.send_message(
                 chat_id=message.chat_id,
                 text=FALLBACK_CAPTION,
