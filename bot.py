@@ -16,6 +16,7 @@ Setup:
 
 import os
 import re
+import json
 import threading
 import logging
 import difflib
@@ -78,23 +79,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Tracks (chat_id, thread_id, normalized_title) that already got a cover
-# posted, so multi-part uploads (Part 1, Part 2, CD1, CD2...) of the same
-# movie only get the poster/info once. This resets if the bot restarts —
-# fine in practice since parts are almost always uploaded close together.
-_recently_posted: dict[tuple, None] = {}
-_RECENT_LIMIT = 500  # cap memory usage; oldest entries drop off first
+# Tracks which movies/shows already got a cover posted per chat/topic, so
+# multi-part or multi-episode uploads of the same title only get the
+# poster/info once. Keyed by TMDB ID when we have a match (reliable even
+# if the extracted title text varies slightly between episodes), falling
+# back to normalized title text only when there's no TMDB match at all.
+# Persisted to disk so it survives the bot briefly sleeping/waking up
+# (it resets only on an actual redeploy).
+_DEDUP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "posted_titles.json")
+_RECENT_LIMIT = 1000  # cap memory/file size; oldest entries drop off first
 
 
-def _mark_posted(chat_id: int, thread_id: int | None, title: str) -> None:
-    key = (chat_id, thread_id, title.strip().lower())
-    _recently_posted[key] = None
+def _load_recently_posted() -> dict:
+    try:
+        with open(_DEDUP_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+_recently_posted: dict = _load_recently_posted()
+
+
+def _save_recently_posted() -> None:
+    try:
+        with open(_DEDUP_FILE, "w") as f:
+            json.dump(_recently_posted, f)
+    except Exception as e:
+        logger.warning("Could not persist dedup file: %s", e)
+
+
+def _dedup_key(chat_id: int, thread_id: int | None, meta: dict | None, title: str) -> str:
+    if meta and meta.get("id") is not None:
+        identity = f"tmdb:{meta.get('media_type')}:{meta['id']}"
+    else:
+        identity = f"title:{title.strip().lower()}"
+    return f"{chat_id}:{thread_id}:{identity}"
+
+
+def _mark_posted(chat_id: int, thread_id: int | None, meta: dict | None, title: str) -> None:
+    key = _dedup_key(chat_id, thread_id, meta, title)
+    _recently_posted[key] = True
     if len(_recently_posted) > _RECENT_LIMIT:
         _recently_posted.pop(next(iter(_recently_posted)))
+    _save_recently_posted()
 
 
-def _was_recently_posted(chat_id: int, thread_id: int | None, title: str) -> bool:
-    return (chat_id, thread_id, title.strip().lower()) in _recently_posted
+def _was_recently_posted(chat_id: int, thread_id: int | None, meta: dict | None, title: str) -> bool:
+    return _dedup_key(chat_id, thread_id, meta, title) in _recently_posted
 
 # ---------------------------------------------------------------------------
 # Title cleanup
@@ -326,11 +358,11 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         # 1. Post the cover + info FIRST (or the fallback bio if no match),
-        #    but only if we haven't already posted for this exact title in
+        #    but only if we haven't already posted for this exact movie in
         #    this chat/topic — avoids repeating it for every episode/part.
-        already_posted = _was_recently_posted(message.chat_id, thread_id, title)
+        already_posted = _was_recently_posted(message.chat_id, thread_id, meta, title)
         if meta and not already_posted:
-            info_caption, poster_url = format_announcement(meta, vj_credit)
+            info_caption, poster_url = format_announcement(meta)
             if poster_url:
                 await context.bot.send_photo(
                     chat_id=message.chat_id,
@@ -346,33 +378,35 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.MARKDOWN,
                     message_thread_id=thread_id,
                 )
-            _mark_posted(message.chat_id, thread_id, title)
+            _mark_posted(message.chat_id, thread_id, meta, title)
         elif not meta and not already_posted:
-            bio_text = FALLBACK_CAPTION
-            if vj_credit:
-                bio_text += f"\n\n🎙️ Translated by: {vj_credit}"
             await context.bot.send_message(
                 chat_id=message.chat_id,
-                text=bio_text,
+                text=FALLBACK_CAPTION,
                 message_thread_id=thread_id,
             )
-            _mark_posted(message.chat_id, thread_id, title)
+            _mark_posted(message.chat_id, thread_id, meta, title)
 
-        # 2. Re-post the actual video/file (with the cleaned caption) right
+        # 2. Re-post the actual video/file (with the cleaned caption, plus
+        #    the VJ credit attached here, right under the video itself)
         #    below the announcement. Reusing the file_id means Telegram
         #    just re-links the existing file — no re-uploading of bytes.
+        video_caption = original_caption
+        if vj_credit:
+            video_caption = f"{original_caption}\n\n🎙️ {vj_credit}" if original_caption else vj_credit
+
         if message.video:
             await context.bot.send_video(
                 chat_id=message.chat_id,
                 video=message.video.file_id,
-                caption=original_caption,
+                caption=video_caption,
                 message_thread_id=thread_id,
             )
         else:
             await context.bot.send_document(
                 chat_id=message.chat_id,
                 document=message.document.file_id,
-                caption=original_caption,
+                caption=video_caption,
                 message_thread_id=thread_id,
             )
 
