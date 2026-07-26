@@ -109,24 +109,23 @@ def _save_recently_posted() -> None:
         logger.warning("Could not persist dedup file: %s", e)
 
 
-def _dedup_key(chat_id: int, thread_id: int | None, meta: dict | None, title: str) -> str:
+def _dedup_keys(chat_id: int, thread_id: int | None, meta: dict | None, title: str) -> list[str]:
+    keys = [f"{chat_id}:{thread_id}:title:{title.strip().lower()}"]
     if meta and meta.get("id") is not None:
-        identity = f"tmdb:{meta.get('media_type')}:{meta['id']}"
-    else:
-        identity = f"title:{title.strip().lower()}"
-    return f"{chat_id}:{thread_id}:{identity}"
+        keys.append(f"{chat_id}:{thread_id}:tmdb:{meta.get('media_type')}:{meta['id']}")
+    return keys
 
 
 def _mark_posted(chat_id: int, thread_id: int | None, meta: dict | None, title: str) -> None:
-    key = _dedup_key(chat_id, thread_id, meta, title)
-    _recently_posted[key] = True
+    for key in _dedup_keys(chat_id, thread_id, meta, title):
+        _recently_posted[key] = True
     if len(_recently_posted) > _RECENT_LIMIT:
         _recently_posted.pop(next(iter(_recently_posted)))
     _save_recently_posted()
 
 
 def _was_recently_posted(chat_id: int, thread_id: int | None, meta: dict | None, title: str) -> bool:
-    return _dedup_key(chat_id, thread_id, meta, title) in _recently_posted
+    return any(key in _recently_posted for key in _dedup_keys(chat_id, thread_id, meta, title))
 
 # ---------------------------------------------------------------------------
 # Title cleanup
