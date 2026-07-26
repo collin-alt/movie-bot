@@ -202,25 +202,58 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     caption, poster_url = format_announcement(meta)
+    thread_id = message.message_thread_id  # keeps it in the same topic, if any
 
     try:
+        # 1. Post the cover + info FIRST
         if poster_url:
             await context.bot.send_photo(
                 chat_id=message.chat_id,
                 photo=poster_url,
                 caption=caption,
                 parse_mode=ParseMode.MARKDOWN,
-                reply_to_message_id=message.message_id,
+                message_thread_id=thread_id,
             )
         else:
             await context.bot.send_message(
                 chat_id=message.chat_id,
                 text=caption,
                 parse_mode=ParseMode.MARKDOWN,
-                reply_to_message_id=message.message_id,
+                message_thread_id=thread_id,
+            )
+
+        # 2. Re-post the actual video/file right below the announcement.
+        #    Reusing the file_id means Telegram just re-links the existing
+        #    file — no re-uploading of the actual video bytes.
+        original_caption = message.caption or None
+        if message.video:
+            await context.bot.send_video(
+                chat_id=message.chat_id,
+                video=message.video.file_id,
+                caption=original_caption,
+                message_thread_id=thread_id,
+            )
+        else:
+            await context.bot.send_document(
+                chat_id=message.chat_id,
+                document=message.document.file_id,
+                caption=original_caption,
+                message_thread_id=thread_id,
+            )
+
+        # 3. Remove the original upload so it isn't duplicated.
+        #    Requires the bot to have "Delete Messages" admin permission.
+        try:
+            await context.bot.delete_message(
+                chat_id=message.chat_id, message_id=message.message_id
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not delete original upload (check bot has Delete "
+                "Messages permission): %s", e
             )
     except Exception as e:
-        logger.error("Failed to send announcement: %s", e)
+        logger.error("Failed to post announcement/repost file: %s", e)
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
