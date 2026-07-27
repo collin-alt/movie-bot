@@ -178,11 +178,22 @@ def extract_vj_credit(text: str) -> str | None:
     return "Vj " + match.group(1).title()
 
 
-def clean_title(filename: str) -> tuple[str, str | None]:
-    """Extract a probable (title, year) pair from a release filename or caption."""
+def clean_title(filename: str) -> tuple[str, str | None, bool]:
+    """Extract a probable (title, year, is_series) triple from a release
+    filename or caption. is_series is True only if the raw text actually
+    contains an episode/season marker (S01E02, Episode 3, Season 2...) —
+    used so a plain title with no such marker searches movies only,
+    instead of risking a match against an unrelated TV show of the same
+    name."""
     # Only look at the first non-empty line. Multi-line captions from
     # source channels are almost always: [title line] + [promo/spam block].
     first_line = next((ln for ln in filename.splitlines() if ln.strip()), filename)
+
+    is_series = bool(
+        re.search(r"\bs\d{1,2}[.\s]*e\d{1,3}\b", first_line, re.IGNORECASE)
+        or re.search(r"\b(episode|ep)\.?\s*\d+\b", first_line, re.IGNORECASE)
+        or re.search(r"\bseason\s*\d+\b", first_line, re.IGNORECASE)
+    )
 
     # Strip a real video file extension only (avoid os.path.splitext here —
     # it would wrongly treat something like "...VJ JR.2026" as if ".2026"
@@ -224,18 +235,20 @@ def clean_title(filename: str) -> tuple[str, str | None]:
         name = re.sub(pattern, "", name, flags=re.IGNORECASE)
 
     name = re.sub(r"\s+", " ", name).strip(" -_")
-    return name, year
+    return name, year, is_series
 
 
 # ---------------------------------------------------------------------------
 # TMDB lookup
 # ---------------------------------------------------------------------------
 
-def search_tmdb(title: str, year: str | None = None) -> dict | None:
+def search_tmdb(title: str, year: str | None = None, is_series: bool = False) -> dict | None:
     if not TMDB_API_KEY:
         return None
 
-    def _query(with_year: bool) -> list[dict]:
+    allowed_types = ("tv",) if is_series else ("movie",)
+
+    def _query(with_year: bool, restrict_type: bool = True) -> list[dict]:
         params = {"api_key": TMDB_API_KEY, "query": title, "include_adult": "false"}
         if with_year and year:
             params["year"] = year
@@ -246,7 +259,8 @@ def search_tmdb(title: str, year: str | None = None) -> dict | None:
         except requests.RequestException as e:
             logger.warning("TMDB lookup failed: %s", e)
             return []
-        return [r for r in results if r.get("media_type") in ("movie", "tv")]
+        types = allowed_types if restrict_type else ("movie", "tv")
+        return [r for r in results if r.get("media_type") in types]
 
     def _best_match(results: list[dict]) -> dict | None:
         if not results:
@@ -273,11 +287,16 @@ def search_tmdb(title: str, year: str | None = None) -> dict | None:
         return best
 
     # Try with the year first (more precise), then fall back without it in
-    # case the number we extracted wasn't actually a release year.
+    # case the number we extracted wasn't actually a release year, and
+    # finally allow both media types as a last resort in case our
+    # movie-vs-series guess was wrong for this particular title.
     result = _best_match(_query(with_year=True))
     if not result and year:
         logger.info("No confident match with year=%s, retrying without year filter", year)
         result = _best_match(_query(with_year=False))
+    if not result:
+        logger.info("No confident match restricted to %s, retrying with both types", allowed_types)
+        result = _best_match(_query(with_year=bool(year), restrict_type=False))
     return result
 
 
@@ -365,20 +384,20 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
 
     # Try the actual filename first...
     if filename:
-        title, year = clean_title(filename)
+        title, year, is_series = clean_title(filename)
         if title:
-            logger.info("Trying filename-derived title: %r year=%r", title, year)
-            meta = search_tmdb(title, year)
+            logger.info("Trying filename-derived title: %r year=%r is_series=%r", title, year, is_series)
+            meta = search_tmdb(title, year, is_series)
 
     # ...then fall back to the caption if that didn't find anything. This
     # matters a lot for groups where the real file has a generic/random
     # name (e.g. "VID2024.mp4") but the actual title is written in the
     # caption instead.
     if not meta and caption_text:
-        cap_title, cap_year = clean_title(caption_text)
+        cap_title, cap_year, cap_is_series = clean_title(caption_text)
         if cap_title and cap_title != title:
-            logger.info("Trying caption-derived title: %r year=%r", cap_title, cap_year)
-            meta = search_tmdb(cap_title, cap_year)
+            logger.info("Trying caption-derived title: %r year=%r is_series=%r", cap_title, cap_year, cap_is_series)
+            meta = search_tmdb(cap_title, cap_year, cap_is_series)
             if meta:
                 title, year = cap_title, cap_year
 
