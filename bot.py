@@ -75,6 +75,17 @@ FALLBACK_CAPTION = (
     "🌟 Stay tuned, more coming soon! 🚀"
 )
 
+# Static .webp stickers sent alongside the fallback bio for a bit of fun.
+STICKERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stickers")
+STICKER_FILES = ["hi.webp", "ok.webp", "laughing_mouse.webp", "cool.webp"]
+
+
+def _random_sticker_path() -> str | None:
+    available = [f for f in STICKER_FILES if os.path.isfile(os.path.join(STICKERS_DIR, f))]
+    if not available:
+        return None
+    return os.path.join(STICKERS_DIR, random.choice(available))
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -474,6 +485,17 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
                     text=FALLBACK_CAPTION,
                     message_thread_id=thread_id,
                 )
+                sticker_path = _random_sticker_path()
+                if sticker_path:
+                    try:
+                        with open(sticker_path, "rb") as sticker_file:
+                            await context.bot.send_sticker(
+                                chat_id=message.chat_id,
+                                sticker=sticker_file,
+                                message_thread_id=thread_id,
+                            )
+                    except Exception as e:
+                        logger.warning("Could not send sticker: %s", e)
             _mark_posted(message.chat_id, thread_id, meta, title)
 
         # 2. Re-post the actual video/file, labeled "Title N" for TV shows
