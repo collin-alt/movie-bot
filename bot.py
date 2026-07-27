@@ -65,15 +65,89 @@ TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 
 # Posted instead of the poster/synopsis whenever a movie can't be matched
 # on TMDB, so the audience still sees something clean instead of the
-# original promo/spam caption from the source channel.
-FALLBACK_CAPTION = (
-    "🎬✨ TRANSLATED MOVIES™️ ✨🎬\n\n"
-    "🍿 We deliver all your favorite TRANSLATED movies & shows, straight to "
-    "this group — fresh uploads added regularly! 🔥📽️\n\n"
-    "✈️ Telegram: @collyni | @wilber256\n"
-    "🟢 WhatsApp: 0744546518 | 0775716867\n\n"
-    "🌟 Stay tuned, more coming soon! 🚀"
-)
+# original promo/spam caption from the source channel. One is picked at
+# random each time so it doesn't feel repetitive.
+FALLBACK_CAPTIONS = [
+    (
+        "🎬✨ TRANSLATED MOVIES™️ ✨🎬\n\n"
+        "🍿 We deliver all your favorite TRANSLATED movies & shows, straight to "
+        "this group — fresh uploads added regularly! 🔥📽️\n\n"
+        "✈️ Telegram: @collyni | @wilber256\n"
+        "🟢 WhatsApp: 0744546518 | 0775716867\n\n"
+        "🌟 Stay tuned, more coming soon! 🚀"
+    ),
+    (
+        "🔥🎬 TRANSLATED MOVIES™️ 🎬🔥\n\n"
+        "The hottest TRANSLATED movies & shows land here first! 🍿⚡ New drops "
+        "all the time — don't sleep on it.\n\n"
+        "✈️ Telegram: @collyni | @wilber256\n"
+        "🟢 WhatsApp: 0744546518 | 0775716867\n\n"
+        "👀 Keep watching, more loading... 🚀"
+    ),
+    (
+        "🎥 Welcome to TRANSLATED MOVIES™️ 🎥\n\n"
+        "A home for movie lovers — every upload here is TRANSLATED just for "
+        "you. 🍿💬 New titles added often, so stick around!\n\n"
+        "✈️ Telegram: @collyni | @wilber256\n"
+        "🟢 WhatsApp: 0744546518 | 0775716867\n\n"
+        "🌍 Thanks for being part of the family! 💫"
+    ),
+    (
+        "🍿✨ TRANSLATED MOVIES™️ ✨🍿\n\n"
+        "Popcorn ready? 🎬 New TRANSLATED movies & shows keep sliding into "
+        "this group — grab a seat! 🛋️\n\n"
+        "✈️ Telegram: @collyni | @wilber256\n"
+        "🟢 WhatsApp: 0744546518 | 0775716867\n\n"
+        "🎞️ Stay glued, more coming! 🔥"
+    ),
+    (
+        "📢 TRANSLATED MOVIES™️ 📢\n\n"
+        "Your go-to spot for TRANSLATED movies & shows — updated regularly, "
+        "no cap. 🎬🔥\n\n"
+        "✈️ Telegram: @collyni | @wilber256\n"
+        "🟢 WhatsApp: 0744546518 | 0775716867\n\n"
+        "🚨 More titles dropping soon 🚨"
+    ),
+    (
+        "🔥🎬 TRANSLATED MOVIES™️ 🎬🔥\n\n"
+        "The hottest TRANSLATED movies & shows land here first! 🍿⚡ From "
+        "blockbuster action to gripping drama, thrillers, comedy, and "
+        "everything in between — if it's worth watching, it's worth "
+        "TRANSLATING, and you'll find it right here.\n\n"
+        "New drops all the time, so keep your notifications on — you don't "
+        "want to miss what's coming next. 🎥💥\n\n"
+        "#TranslatedMovies #NewUploads #MovieNight #VJTranslated\n\n"
+        "✈️ Telegram: @collyni | @wilber256\n"
+        "🟢 WhatsApp: 0744546518 | 0775716867\n\n"
+        "👀 Keep watching, more loading... 🚀"
+    ),
+    (
+        "🎥 Welcome to TRANSLATED MOVIES™️ 🎥\n\n"
+        "A home for movie lovers — every upload here is TRANSLATED just for "
+        "you, picked with care so you never run out of something great to "
+        "watch. 🍿💬\n\n"
+        "Whether you're into action, romance, thrillers, or something "
+        "totally unexpected, this group has a little bit of everything. New "
+        "titles added often, so stick around and be part of the movement! "
+        "🌍✨\n\n"
+        "#TranslatedMovies #MovieCommunity #VJContent #StayTuned\n\n"
+        "✈️ Telegram: @collyni | @wilber256\n"
+        "🟢 WhatsApp: 0744546518 | 0775716867\n\n"
+        "🌍 Thanks for being part of the family! 💫"
+    ),
+    (
+        "📢 TRANSLATED MOVIES™️ 📢\n\n"
+        "Your go-to spot for TRANSLATED movies & shows — updated regularly, "
+        "no cap. 🎬🔥 We bring you the latest and greatest, all translated "
+        "and ready to watch, so you never have to go searching elsewhere.\n\n"
+        "Big releases, hidden gems, and everything worth your time — this "
+        "is the place. 🎞️\n\n"
+        "#TranslatedMovies #NewReleases #MovieHub #VJUpload\n\n"
+        "✈️ Telegram: @collyni | @wilber256\n"
+        "🟢 WhatsApp: 0744546518 | 0775716867\n\n"
+        "🚨 More titles dropping soon 🚨"
+    ),
+]
 
 # Static .webp stickers sent alongside the fallback bio for a bit of fun.
 STICKERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stickers")
@@ -532,7 +606,7 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
             if _should_post_fallback_bio(message.chat_id, thread_id):
                 await context.bot.send_message(
                     chat_id=message.chat_id,
-                    text=FALLBACK_CAPTION,
+                    text=random.choice(FALLBACK_CAPTIONS),
                     message_thread_id=thread_id,
                 )
                 sticker_path = _random_sticker_path()
