@@ -410,18 +410,17 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             _mark_posted(message.chat_id, thread_id, meta, title)
 
-        # 2. Re-post the actual video/file (with the cleaned caption, plus
-        #    the VJ credit attached here, right under the video itself)
-        #    below the announcement. Reusing the file_id means Telegram
-        #    just re-links the existing file — no re-uploading of bytes.
-        # 2. Re-post the actual video/file, labeled "Title N" (in upload
-        #    order) with the VJ credit attached here, right under the
-        #    video itself, below the announcement. Reusing the file_id
-        #    means Telegram just re-links the existing file — no
-        #    re-uploading of bytes.
+        # 2. Re-post the actual video/file, labeled "Title N" for TV shows
+        #    (in upload order) or just "Title" for single movies, with the
+        #    VJ credit attached here, right under the video itself, below
+        #    the announcement. Reusing the file_id means Telegram just
+        #    re-links the existing file — no re-uploading of bytes.
         display_title = (meta.get("title") or meta.get("name")) if meta else title
-        episode_number = _next_episode_number(message.chat_id, thread_id, meta, title)
-        video_caption = f"{display_title} {episode_number}"
+        if meta and meta.get("media_type") == "tv":
+            episode_number = _next_episode_number(message.chat_id, thread_id, meta, title)
+            video_caption = f"{display_title} {episode_number}"
+        else:
+            video_caption = display_title
         if vj_credit:
             video_caption += f"\n\n🎙️ {vj_credit}"
 
