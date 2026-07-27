@@ -17,6 +17,7 @@ Setup:
 import os
 import re
 import json
+import random
 import asyncio
 import threading
 import logging
@@ -127,6 +128,29 @@ def _mark_posted(chat_id: int, thread_id: int | None, meta: dict | None, title: 
 
 def _was_recently_posted(chat_id: int, thread_id: int | None, meta: dict | None, title: str) -> bool:
     return any(key in _recently_posted for key in _dedup_keys(chat_id, thread_id, meta, title))
+
+
+def _should_post_fallback_bio(chat_id: int, thread_id: int | None) -> bool:
+    """Only show the fallback bio every 2-4 no-match uploads (randomly),
+    not on every single one, so it doesn't feel repetitive/spammy."""
+    count_key = f"{chat_id}:{thread_id}:nomatch_count"
+    threshold_key = f"{chat_id}:{thread_id}:nomatch_threshold"
+
+    if threshold_key not in _recently_posted:
+        _recently_posted[threshold_key] = random.randint(2, 4)
+
+    count = _recently_posted.get(count_key, 0) + 1
+    threshold = _recently_posted[threshold_key]
+
+    if count >= threshold:
+        _recently_posted[count_key] = 0
+        _recently_posted[threshold_key] = random.randint(2, 4)
+        _save_recently_posted()
+        return True
+
+    _recently_posted[count_key] = count
+    _save_recently_posted()
+    return False
 
 
 def _next_episode_number(chat_id: int, thread_id: int | None, meta: dict | None, title: str) -> int:
@@ -444,11 +468,12 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
                 )
             _mark_posted(message.chat_id, thread_id, meta, title)
         elif not meta and not already_posted:
-            await context.bot.send_message(
-                chat_id=message.chat_id,
-                text=FALLBACK_CAPTION,
-                message_thread_id=thread_id,
-            )
+            if _should_post_fallback_bio(message.chat_id, thread_id):
+                await context.bot.send_message(
+                    chat_id=message.chat_id,
+                    text=FALLBACK_CAPTION,
+                    message_thread_id=thread_id,
+                )
             _mark_posted(message.chat_id, thread_id, meta, title)
 
         # 2. Re-post the actual video/file, labeled "Title N" for TV shows
