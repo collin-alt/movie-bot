@@ -362,6 +362,51 @@ def format_announcement(meta: dict, vj_credit: str | None = None) -> tuple[str, 
     return caption, poster_url
 
 
+FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "Poppins-Bold.ttf")
+
+
+def add_vj_watermark(poster_url: str, vj_credit: str) -> bytes | None:
+    """Download the poster and stamp a 'Vj Name' badge onto its top-right
+    corner, similar to how VJs brand their own posters manually. Returns
+    the modified image bytes, or None if anything goes wrong (caller
+    should fall back to the plain poster_url in that case)."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        from io import BytesIO
+
+        resp = requests.get(poster_url, timeout=10)
+        resp.raise_for_status()
+        img = Image.open(BytesIO(resp.content)).convert("RGBA")
+        W, H = img.size
+
+        label = vj_credit.upper()
+        font_size = max(18, W // 14)
+        font = ImageFont.truetype(FONT_PATH, font_size)
+
+        draw = ImageDraw.Draw(img)
+        pad_x, pad_y = font_size // 2, font_size // 3
+        bbox = draw.textbbox((0, 0), label, font=font)
+        text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        badge_w, badge_h = text_w + pad_x * 2, text_h + pad_y * 2
+
+        margin = W * 0.03
+        x0, y0 = W - badge_w - margin, margin
+        x1, y1 = x0 + badge_w, y0 + badge_h
+
+        # Yellow badge with a dark blue border, like the reference example
+        draw.rounded_rectangle([x0, y0, x1, y1], radius=badge_h * 0.25,
+                                fill=(255, 221, 0, 255), outline=(20, 30, 90, 255),
+                                width=max(2, font_size // 12))
+        draw.text((x0 + pad_x - bbox[0], y0 + pad_y - bbox[1]), label, font=font, fill=(15, 15, 60, 255))
+
+        out = BytesIO()
+        img.convert("RGB").save(out, format="JPEG", quality=90)
+        return out.getvalue()
+    except Exception as e:
+        logger.warning("Could not watermark poster: %s", e)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -461,11 +506,16 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
         #    this chat/topic — avoids repeating it for every episode/part.
         already_posted = _was_recently_posted(message.chat_id, thread_id, meta, title)
         if meta and not already_posted:
-            info_caption, poster_url = format_announcement(meta)
+            info_caption, poster_url = format_announcement(meta, vj_credit)
             if poster_url:
+                photo_to_send = poster_url
+                if vj_credit:
+                    watermarked = add_vj_watermark(poster_url, vj_credit)
+                    if watermarked:
+                        photo_to_send = watermarked
                 await context.bot.send_photo(
                     chat_id=message.chat_id,
-                    photo=poster_url,
+                    photo=photo_to_send,
                     caption=info_caption,
                     parse_mode=ParseMode.MARKDOWN,
                     message_thread_id=thread_id,
