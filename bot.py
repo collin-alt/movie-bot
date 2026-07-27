@@ -433,16 +433,20 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
             _mark_posted(message.chat_id, thread_id, meta, title)
 
         # 2. Re-post the actual video/file, labeled "Title N" for TV shows
-        #    (in upload order) or just "Title" for single movies, with the
-        #    VJ credit attached here, right under the video itself, below
-        #    the announcement. Reusing the file_id means Telegram just
-        #    re-links the existing file — no re-uploading of bytes.
+        #    (in upload order) or just "Title" for a one-off upload, with
+        #    the VJ credit attached here, right under the video itself,
+        #    below the announcement. Reusing the file_id means Telegram
+        #    just re-links the existing file — no re-uploading of bytes.
+        #
+        #    Numbering is based on whether this exact title has actually
+        #    been uploaded before in this chat/topic — NOT on TMDB's
+        #    movie/TV classification, which isn't reliable enough (e.g.
+        #    TMDB lists some one-off films as "TV" in their database). A
+        #    true single upload never gets a second one, so it never gets
+        #    numbered; only a real second/third part or episode does.
         display_title = (meta.get("title") or meta.get("name")) if meta else title
-        if meta and meta.get("media_type") == "tv":
-            episode_number = _next_episode_number(message.chat_id, thread_id, meta, title)
-            video_caption = f"{display_title} {episode_number}"
-        else:
-            video_caption = display_title
+        episode_number = _next_episode_number(message.chat_id, thread_id, meta, title)
+        video_caption = f"{display_title} {episode_number}" if episode_number > 1 else display_title
         if vj_credit:
             video_caption += f"\n\n🎙️ {vj_credit}"
 
