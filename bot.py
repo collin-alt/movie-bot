@@ -463,8 +463,10 @@ def add_vj_watermark(poster_url: str, vj_credit: str) -> bytes | None:
         text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         badge_w, badge_h = text_w + pad_x * 2, text_h + pad_y * 2
 
-        margin = W * 0.03
-        x0, y0 = W - badge_w - margin, margin
+        margin_x = W * 0.03
+        margin_y = H * 0.06  # further from the top than the sides, so
+                              # Telegram's own overlay UI never covers it
+        x0, y0 = W - badge_w - margin_x, margin_y
         x1, y1 = x0 + badge_w, y0 + badge_h
 
         # Yellow badge with a dark blue border, like the reference example
