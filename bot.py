@@ -17,6 +17,7 @@ Setup:
 import os
 import re
 import json
+import asyncio
 import threading
 import logging
 import difflib
@@ -311,6 +312,22 @@ def format_announcement(meta: dict, vj_credit: str | None = None) -> tuple[str, 
 # Handlers
 # ---------------------------------------------------------------------------
 
+# One lock per (chat_id, thread_id) so uploads to the same group/topic are
+# always handled one at a time, in order. This matters when several files
+# of the same movie/show (e.g. Part 1 + Part 2) get sent together — without
+# this, two uploads could both check "already posted?" at the same instant
+# before either finishes marking it, resulting in the cover being posted
+# twice. It also keeps reposts coming out in the same order they arrived.
+_chat_locks: dict[tuple, asyncio.Lock] = {}
+
+
+def _get_chat_lock(chat_id: int, thread_id: int | None) -> asyncio.Lock:
+    key = (chat_id, thread_id)
+    if key not in _chat_locks:
+        _chat_locks[key] = asyncio.Lock()
+    return _chat_locks[key]
+
+
 async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not message:
@@ -323,6 +340,11 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not file_obj:
         return
 
+    async with _get_chat_lock(message.chat_id, message.message_thread_id):
+        await _process_upload(message, context, file_obj)
+
+
+async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj):
     filename = getattr(file_obj, "file_name", None) or ""
     caption_text = message.caption or ""
 
