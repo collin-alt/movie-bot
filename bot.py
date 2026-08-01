@@ -683,9 +683,160 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
 
 
+async def topicid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send /topicid inside the topic you want announcements to post to —
+    replies with the exact chat_id/thread_id to put in the env vars."""
+    msg = update.effective_message
+    await msg.reply_text(
+        f"chat_id: {msg.chat_id}\n"
+        f"message_thread_id: {msg.message_thread_id}\n\n"
+        f"Put these in Render as UPDATES_CHAT_ID and UPDATES_TOPIC_ID."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Daily movie/show announcements (theaters, streaming, trending + trailers)
+# ---------------------------------------------------------------------------
+
+UPDATES_CHAT_ID = os.getenv("UPDATES_CHAT_ID") or GROUP_CHAT_ID
+UPDATES_TOPIC_ID = os.getenv("UPDATES_TOPIC_ID")
+UPDATES_TOPIC_ID = int(UPDATES_TOPIC_ID) if UPDATES_TOPIC_ID else None
+ANNOUNCEMENTS_PER_DAY = 5
+# Random posting window each day (24h clock, local to the server) — avoids
+# posting in the middle of the night. Adjust if you'd rather it be fully
+# random across all 24 hours.
+RANDOM_WINDOW_START_HOUR = 8
+RANDOM_WINDOW_END_HOUR = 23
+
+TMDB_TRENDING_URL = "https://api.themoviedb.org/3/trending/movie/day"
+TMDB_NOW_PLAYING_URL = "https://api.themoviedb.org/3/movie/now_playing"
+TMDB_DISCOVER_URL = "https://api.themoviedb.org/3/discover/movie"
+TMDB_VIDEOS_URL = "https://api.themoviedb.org/3/movie/{id}/videos"
+
+
+def _tmdb_get(url: str, **params) -> list[dict]:
+    if not TMDB_API_KEY:
+        return []
+    params["api_key"] = TMDB_API_KEY
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("results", [])
+    except requests.RequestException as e:
+        logger.warning("TMDB request failed (%s): %s", url, e)
+        return []
+
+
+def fetch_daily_picks() -> list[dict]:
+    """Pull a diverse mix: trending, in theaters, and new-to-streaming,
+    deduped by movie ID, capped at ANNOUNCEMENTS_PER_DAY."""
+    trending = _tmdb_get(TMDB_TRENDING_URL)
+    theaters = _tmdb_get(TMDB_NOW_PLAYING_URL, region="US")
+    streaming = _tmdb_get(
+        TMDB_DISCOVER_URL, region="US", with_release_type=4,
+        sort_by="release_date.desc",
+        **{"release_date.lte": __import__("datetime").date.today().isoformat()},
+    )
+
+    picks, seen_ids = [], set()
+    for pool in (trending, theaters, streaming):
+        for movie in pool:
+            if movie["id"] in seen_ids:
+                continue
+            seen_ids.add(movie["id"])
+            picks.append(movie)
+            if len(picks) >= ANNOUNCEMENTS_PER_DAY:
+                return picks
+    return picks
+
+
+def fetch_trailer_url(movie_id: int) -> str | None:
+    videos = _tmdb_get(TMDB_VIDEOS_URL.format(id=movie_id))
+    for v in videos:
+        if v.get("site") == "YouTube" and v.get("type") == "Trailer":
+            return f"https://www.youtube.com/watch?v={v['key']}"
+    for v in videos:  # fall back to a teaser if no full trailer exists
+        if v.get("site") == "YouTube" and v.get("type") == "Teaser":
+            return f"https://www.youtube.com/watch?v={v['key']}"
+    return None
+
+
+async def post_daily_announcements(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not UPDATES_CHAT_ID:
+        logger.warning("UPDATES_CHAT_ID not set — skipping daily announcements.")
+        return
+
+    picks = fetch_daily_picks()
+    logger.info("Daily announcements: posting %d picks", len(picks))
+
+    for movie in picks:
+        meta = dict(movie)
+        meta["media_type"] = "movie"
+        caption, poster_url = format_announcement(meta)
+        trailer_url = fetch_trailer_url(movie["id"])
+
+        try:
+            if poster_url:
+                await context.bot.send_photo(
+                    chat_id=UPDATES_CHAT_ID,
+                    photo=poster_url,
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                    message_thread_id=UPDATES_TOPIC_ID,
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=UPDATES_CHAT_ID,
+                    text=caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                    message_thread_id=UPDATES_TOPIC_ID,
+                )
+            if trailer_url:
+                await context.bot.send_message(
+                    chat_id=UPDATES_CHAT_ID,
+                    text=f"🎞️ Trailer: {trailer_url}",
+                    message_thread_id=UPDATES_TOPIC_ID,
+                )
+        except Exception as e:
+            logger.error("Failed to post daily announcement for %s: %s", movie.get("title"), e)
+
+    _schedule_next_daily_run(context.application)
+
+
+def _schedule_next_daily_run(app: Application) -> None:
+    """Pick a random time (within the configured window) for tomorrow and
+    schedule the job to fire once then — re-scheduling itself again each
+    time it runs, so the posting time varies day to day."""
+    import datetime
+
+    now = datetime.datetime.now()
+    tomorrow = now.date() + datetime.timedelta(days=1)
+    rand_hour = random.randint(RANDOM_WINDOW_START_HOUR, RANDOM_WINDOW_END_HOUR - 1)
+    rand_minute = random.randint(0, 59)
+    run_at = datetime.datetime.combine(tomorrow, datetime.time(rand_hour, rand_minute))
+    delay_seconds = (run_at - now).total_seconds()
+
+    app.job_queue.run_once(post_daily_announcements, when=delay_seconds)
+    logger.info("Next daily announcement scheduled for %s (in %.0f minutes)", run_at, delay_seconds / 60)
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
+
+def _seconds_until_first_run() -> float:
+    """On startup, pick a random time within today's window if we haven't
+    passed it yet, otherwise tomorrow's window."""
+    import datetime
+
+    now = datetime.datetime.now()
+    rand_hour = random.randint(RANDOM_WINDOW_START_HOUR, RANDOM_WINDOW_END_HOUR - 1)
+    rand_minute = random.randint(0, 59)
+    run_at = now.replace(hour=rand_hour, minute=rand_minute, second=0, microsecond=0)
+    if run_at <= now:
+        run_at += datetime.timedelta(days=1)
+    return (run_at - now).total_seconds()
+
 
 def main():
     if not BOT_TOKEN:
@@ -701,9 +852,14 @@ def main():
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
+    app.add_handler(CommandHandler("topicid", topicid_cmd))
     app.add_handler(
         MessageHandler((filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, handle_upload)
     )
+
+    # Kick off the first daily announcement at a random time today (if
+    # we're still before the window's end) or tomorrow otherwise.
+    app.job_queue.run_once(post_daily_announcements, when=_seconds_until_first_run())
 
     logger.info("Bot started. Listening for uploads...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
