@@ -35,6 +35,11 @@ from telegram.ext import (
     filters,
 )
 
+try:
+    from telegram.ext import MessageReactionHandler
+except ImportError:
+    MessageReactionHandler = None
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -194,6 +199,48 @@ def _save_recently_posted() -> None:
             json.dump(_recently_posted, f)
     except Exception as e:
         logger.warning("Could not persist dedup file: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Stats store — powers /find, /request, /leaderboard, weekly recap, and
+# milestone celebrations. Persisted to disk the same way as the dedup file.
+# ---------------------------------------------------------------------------
+
+_STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_stats.json")
+
+
+def _load_stats() -> dict:
+    try:
+        with open(_STATS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"upload_log": [], "reaction_counts": {}, "last_milestone": 0}
+
+
+_stats: dict = _load_stats()
+
+
+def _save_stats() -> None:
+    try:
+        with open(_STATS_FILE, "w") as f:
+            json.dump(_stats, f)
+    except Exception as e:
+        logger.warning("Could not persist stats file: %s", e)
+
+
+def _log_upload(title: str, vj: str | None, chat_id: int, message_id: int | None) -> None:
+    import datetime
+
+    _stats.setdefault("upload_log", []).append({
+        "ts": datetime.datetime.now().isoformat(),
+        "title": title,
+        "vj": vj,
+        "chat_id": chat_id,
+        "message_id": message_id,
+    })
+    if len(_stats["upload_log"]) > 5000:
+        _stats["upload_log"] = _stats["upload_log"][-5000:]
+    _save_stats()
 
 
 def _dedup_keys(chat_id: int, thread_id: int | None, meta: dict | None, title: str) -> list[str]:
@@ -581,6 +628,7 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
         #    but only if we haven't already posted for this exact movie in
         #    this chat/topic — avoids repeating it for every episode/part.
         already_posted = _was_recently_posted(message.chat_id, thread_id, meta, title)
+        announcement_message_id = None
         if meta and not already_posted:
             info_caption, poster_url = format_announcement(meta, vj_credit)
             if poster_url:
@@ -589,7 +637,7 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
                     watermarked = add_vj_watermark(poster_url, vj_credit)
                     if watermarked:
                         photo_to_send = watermarked
-                await context.bot.send_photo(
+                sent = await context.bot.send_photo(
                     chat_id=message.chat_id,
                     photo=photo_to_send,
                     caption=info_caption,
@@ -597,20 +645,22 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
                     message_thread_id=thread_id,
                 )
             else:
-                await context.bot.send_message(
+                sent = await context.bot.send_message(
                     chat_id=message.chat_id,
                     text=info_caption,
                     parse_mode=ParseMode.MARKDOWN,
                     message_thread_id=thread_id,
                 )
             _mark_posted(message.chat_id, thread_id, meta, title)
+            announcement_message_id = sent.message_id
         elif not meta and not already_posted:
             if _should_post_fallback_bio(message.chat_id, thread_id):
-                await context.bot.send_message(
+                sent = await context.bot.send_message(
                     chat_id=message.chat_id,
                     text=random.choice(FALLBACK_CAPTIONS),
                     message_thread_id=thread_id,
                 )
+                announcement_message_id = sent.message_id
                 sticker_path = _random_sticker_path()
                 if sticker_path:
                     try:
@@ -668,8 +718,261 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
                 "Could not delete original upload (check bot has Delete "
                 "Messages permission): %s", e
             )
+
+        # Log this upload for /find, /leaderboard, and the weekly recap.
+        _log_upload(display_title, vj_credit, message.chat_id, announcement_message_id)
     except Exception as e:
         logger.error("Failed to post announcement/repost file: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Reaction tracking — powers the "most reacted movie" stat in the weekly
+# recap. Best-effort: if this specific Telegram feature isn't available in
+# the installed library version, it's skipped safely (see MessageReactionHandler
+# import above).
+# ---------------------------------------------------------------------------
+
+async def track_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    mr = update.message_reaction
+    if not mr:
+        return
+    key = str(mr.message_id)
+    delta = len(mr.new_reaction) - len(mr.old_reaction)
+    counts = _stats.setdefault("reaction_counts", {})
+    counts[key] = max(0, counts.get(key, 0) + delta)
+    _save_stats()
+
+
+# ---------------------------------------------------------------------------
+# Welcome message for new members
+# ---------------------------------------------------------------------------
+
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg or not msg.new_chat_members:
+        return
+    for member in msg.new_chat_members:
+        if member.is_bot:
+            continue
+        name = member.full_name or "there"
+        text = (
+            f"👋 Welcome {name} to TRANSLATED MOVIES™️!\n\n"
+            "🍿 New TRANSLATED movies & shows get uploaded regularly across our topics.\n\n"
+            "📌 A few tips:\n"
+            "• /find <title> — check if we've already uploaded something\n"
+            "• /request <title> — ask us to add a movie you want\n\n"
+            "Enjoy! 🎬"
+        )
+        try:
+            await msg.reply_text(text)
+        except Exception as e:
+            logger.warning("Could not send welcome message: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# /find <title> — search the upload log
+# ---------------------------------------------------------------------------
+
+async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = " ".join(context.args).strip().lower() if context.args else ""
+    if not query:
+        await update.message.reply_text("Usage: /find <movie title>")
+        return
+
+    matches = [
+        entry for entry in _stats.get("upload_log", [])
+        if query in (entry.get("title") or "").lower()
+    ]
+    # Most recent first, deduped by title
+    seen_titles = set()
+    unique_matches = []
+    for entry in reversed(matches):
+        t = entry.get("title")
+        if t and t not in seen_titles:
+            seen_titles.add(t)
+            unique_matches.append(entry)
+
+    if not unique_matches:
+        await update.message.reply_text(
+            f"🔍 No match found for \"{query}\".\n\nWant it added? Try /request {query}"
+        )
+        return
+
+    lines = [f"🔍 Found {len(unique_matches)} match(es) for \"{query}\":\n"]
+    for entry in unique_matches[:10]:
+        date_str = entry.get("ts", "")[:10]
+        lines.append(f"🎬 {entry.get('title')} — uploaded {date_str}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# /request <title> — forward a request to the admin's DMs
+# ---------------------------------------------------------------------------
+
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
+
+
+async def request_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query:
+        await update.message.reply_text("Usage: /request <movie title>")
+        return
+
+    requester = update.effective_user
+    requester_name = requester.full_name if requester else "Someone"
+
+    await update.message.reply_text(f"📥 Got it! Your request for \"{query}\" has been sent to the admin.")
+
+    if ADMIN_USER_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=int(ADMIN_USER_ID),
+                text=f"🎬 New movie request from {requester_name}:\n\n\"{query}\"",
+            )
+        except Exception as e:
+            logger.warning("Could not DM admin with request (have they started a chat with the bot?): %s", e)
+    else:
+        logger.warning("ADMIN_USER_ID not set — request from %s for %r was not forwarded.", requester_name, query)
+
+
+# ---------------------------------------------------------------------------
+# /leaderboard — top VJs by upload count
+# ---------------------------------------------------------------------------
+
+def _vj_counts(days: int | None = None) -> list[tuple[str, int]]:
+    import datetime
+
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=days) if days else None
+    counts: dict[str, int] = {}
+    for entry in _stats.get("upload_log", []):
+        vj = entry.get("vj")
+        if not vj:
+            continue
+        if cutoff:
+            try:
+                if datetime.datetime.fromisoformat(entry["ts"]) < cutoff:
+                    continue
+            except Exception:
+                pass
+        counts[vj] = counts.get(vj, 0) + 1
+    return sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+
+
+async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ranked = _vj_counts()
+    if not ranked:
+        await update.message.reply_text("No VJ-credited uploads logged yet.")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 VJ Leaderboard (all-time)\n"]
+    for i, (vj, count) in enumerate(ranked[:10]):
+        prefix = medals[i] if i < len(medals) else f"{i + 1}."
+        lines.append(f"{prefix} {vj} — {count} upload{'s' if count != 1 else ''}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Weekly recap — total uploads, top VJ, most-reacted movie
+# ---------------------------------------------------------------------------
+
+async def post_weekly_recap(context: ContextTypes.DEFAULT_TYPE, reschedule: bool = True) -> None:
+    import datetime
+
+    if not UPDATES_CHAT_ID:
+        logger.warning("UPDATES_CHAT_ID not set — skipping weekly recap.")
+        return
+
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=7)
+    week_entries = []
+    for entry in _stats.get("upload_log", []):
+        try:
+            if datetime.datetime.fromisoformat(entry["ts"]) >= cutoff:
+                week_entries.append(entry)
+        except Exception:
+            continue
+
+    total = len(week_entries)
+    top_vj_list = _vj_counts(days=7)
+    top_vj = top_vj_list[0] if top_vj_list else None
+
+    most_reacted_title, most_reacted_count = None, 0
+    reaction_counts = _stats.get("reaction_counts", {})
+    for entry in week_entries:
+        mid = entry.get("message_id")
+        if mid is None:
+            continue
+        count = reaction_counts.get(str(mid), 0)
+        if count > most_reacted_count:
+            most_reacted_count = count
+            most_reacted_title = entry.get("title")
+
+    lines = ["📊 Weekly Recap — TRANSLATED MOVIES™️\n"]
+    lines.append(f"🎬 {total} movie{'s' if total != 1 else ''} uploaded this week")
+    if top_vj:
+        lines.append(f"🏆 Top VJ: {top_vj[0]} ({top_vj[1]} uploads)")
+    if most_reacted_title and most_reacted_count > 0:
+        lines.append(f"🔥 Most reacted: {most_reacted_title} ({most_reacted_count} reactions)")
+    lines.append("\nThanks for being part of the group! More coming next week 🍿")
+
+    try:
+        await context.bot.send_message(
+            chat_id=UPDATES_CHAT_ID,
+            text="\n".join(lines),
+            message_thread_id=UPDATES_TOPIC_ID,
+        )
+    except Exception as e:
+        logger.error("Failed to post weekly recap: %s", e)
+
+    if reschedule:
+        app = context.application
+        app.job_queue.run_once(post_weekly_recap, when=7 * 24 * 3600)
+
+
+async def testrecap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Posting the weekly recap now...")
+    await post_weekly_recap(context, reschedule=False)
+    await update.message.reply_text("Done — check the Updates topic.")
+
+
+# ---------------------------------------------------------------------------
+# Milestone celebrations — checks member count periodically
+# ---------------------------------------------------------------------------
+
+MILESTONE_STEP = 100
+MILESTONE_CHECK_INTERVAL = 6 * 3600  # every 6 hours
+
+
+async def check_milestone(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = UPDATES_CHAT_ID
+    if not chat_id:
+        return
+    try:
+        count = await context.bot.get_chat_member_count(chat_id)
+    except Exception as e:
+        logger.warning("Could not fetch member count for milestone check: %s", e)
+        return
+
+    last = _stats.get("last_milestone", 0)
+    next_milestone = ((last // MILESTONE_STEP) + 1) * MILESTONE_STEP
+
+    if count >= next_milestone:
+        _stats["last_milestone"] = next_milestone
+        _save_stats()
+        try:
+            gif_path = os.path.join(GIF_DIR, "intro.gif")
+            if os.path.isfile(gif_path):
+                with open(gif_path, "rb") as f:
+                    await context.bot.send_animation(
+                        chat_id=chat_id, animation=f, message_thread_id=UPDATES_TOPIC_ID,
+                    )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🎉🎊 We just hit {next_milestone} members! 🎊🎉\n\nThanks for being part of TRANSLATED MOVIES™️ — here's to many more! 🍿🔥",
+                message_thread_id=UPDATES_TOPIC_ID,
+            )
+        except Exception as e:
+            logger.error("Failed to post milestone celebration: %s", e)
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1035,6 +1338,15 @@ def main():
     app.add_handler(CommandHandler("topicid", topicid_cmd))
     app.add_handler(CommandHandler("testannounce", testannounce_cmd))
     app.add_handler(CommandHandler("testpoll", testpoll_cmd))
+    app.add_handler(CommandHandler("testrecap", testrecap_cmd))
+    app.add_handler(CommandHandler("find", find_cmd))
+    app.add_handler(CommandHandler("request", request_cmd))
+    app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
+    if MessageReactionHandler:
+        app.add_handler(MessageReactionHandler(track_reaction))
+    else:
+        logger.warning("MessageReactionHandler not available in this PTB version — reaction tracking disabled.")
     app.add_handler(
         MessageHandler((filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, handle_upload)
     )
@@ -1044,6 +1356,10 @@ def main():
     app.job_queue.run_once(post_daily_announcements, when=_seconds_until_first_run())
     # Engagement polls run on their own independent schedule.
     app.job_queue.run_once(post_engagement_poll, when=_seconds_until_first_run() + 3600)
+    # Weekly recap, 7 days from now.
+    app.job_queue.run_once(post_weekly_recap, when=7 * 24 * 3600)
+    # Milestone check, every 6 hours.
+    app.job_queue.run_repeating(check_milestone, interval=MILESTONE_CHECK_INTERVAL, first=60)
 
     logger.info("Bot started. Listening for uploads...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
