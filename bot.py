@@ -694,6 +694,14 @@ async def topicid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def testannounce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually fire the daily announcements right now, for testing —
+    doesn't wait for or affect the random daily schedule."""
+    await update.message.reply_text("Posting today's picks now, one moment...")
+    await post_daily_announcements(context, reschedule=False)
+    await update.message.reply_text("Done — check the Updates topic.")
+
+
 # ---------------------------------------------------------------------------
 # Daily movie/show announcements (theaters, streaming, trending + trailers)
 # ---------------------------------------------------------------------------
@@ -761,7 +769,7 @@ def fetch_trailer_url(movie_id: int) -> str | None:
     return None
 
 
-async def post_daily_announcements(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def post_daily_announcements(context: ContextTypes.DEFAULT_TYPE, reschedule: bool = True) -> None:
     if not UPDATES_CHAT_ID:
         logger.warning("UPDATES_CHAT_ID not set — skipping daily announcements.")
         return
@@ -800,7 +808,8 @@ async def post_daily_announcements(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             logger.error("Failed to post daily announcement for %s: %s", movie.get("title"), e)
 
-    _schedule_next_daily_run(context.application)
+    if reschedule:
+        _schedule_next_daily_run(context.application)
 
 
 def _schedule_next_daily_run(app: Application) -> None:
@@ -853,6 +862,7 @@ def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("topicid", topicid_cmd))
+    app.add_handler(CommandHandler("testannounce", testannounce_cmd))
     app.add_handler(
         MessageHandler((filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, handle_upload)
     )
