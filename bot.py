@@ -834,12 +834,15 @@ async def post_daily_announcements(context: ContextTypes.DEFAULT_TYPE, reschedul
 # ---------------------------------------------------------------------------
 
 STATIC_POLL_QUESTIONS = [
-    ("🎬 What are you in the mood for?", ["Action", "Comedy", "Horror", "Romance", "Thriller", "Sci-Fi"]),
-    ("🍿 Which genre should we upload more of?", ["Action", "Drama", "Horror", "Animation", "Crime"]),
+    ("🎬 What are you in the mood for?", ["🔫 Action", "😂 Comedy", "👻 Horror", "❤️ Romance", "🔪 Thriller", "🚀 Sci-Fi"]),
+    ("🍿 Which genre should we upload more of?", ["🔫 Action", "🎭 Drama", "👻 Horror", "🎨 Animation", "🕵️ Crime"]),
     ("⭐ How would you rate this week's uploads?", ["🔥 Excellent", "👍 Good", "😐 Okay", "👎 Not great"]),
-    ("🎥 Movie night pick — what's the vibe?", ["Something scary", "Something funny", "Something emotional", "Something action-packed"]),
-    ("🌍 Which region's movies do you want more of?", ["Hollywood", "Nollywood", "Bollywood", "Korean", "Local/African"]),
+    ("🎥 Movie night pick — what's the vibe?", ["😱 Something scary", "😂 Something funny", "😢 Something emotional", "💥 Something action-packed"]),
+    ("🌍 Which region's movies do you want more of?", ["🎬 Hollywood", "🎞️ Nollywood", "🎪 Bollywood", "🇰🇷 Korean", "🌍 Local/African"]),
 ]
+
+GIF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gifs")
+POLL_INTRO_GIFS = ["intro.gif"]
 
 
 def _fetch_trending_poll_options() -> list[str] | None:
@@ -850,15 +853,75 @@ def _fetch_trending_poll_options() -> list[str] | None:
     return titles if len(titles) >= 3 else None
 
 
+def _fetch_trivia_question() -> tuple[str, list[str], int] | None:
+    """Build a quiz-mode trivia question from a real trending movie:
+    'What year was X released?' with 3 wrong-year distractors. Returns
+    (question, options, correct_option_id), or None if TMDB is unreachable."""
+    trending = _tmdb_get(TMDB_TRENDING_URL)
+    candidates = [m for m in trending if m.get("title") and m.get("release_date")]
+    if not candidates:
+        return None
+
+    movie = random.choice(candidates)
+    correct_year = int(movie["release_date"][:4])
+
+    distractors = set()
+    while len(distractors) < 3:
+        offset = random.choice([-3, -2, -1, 1, 2, 3])
+        year = correct_year + offset
+        if year != correct_year:
+            distractors.add(year)
+
+    years = list(distractors) + [correct_year]
+    random.shuffle(years)
+    correct_option_id = years.index(correct_year)
+    options = [str(y) for y in years]
+    question = f"🧠 What year was \"{movie['title']}\" released?"
+    return question, options, correct_option_id
+
+
+async def _send_poll_lead_in(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A little 'drumroll' before the poll — either a themed GIF or a fun
+    sticker, picked at random, to make the poll feel more alive."""
+    try:
+        if random.random() < 0.5 and POLL_INTRO_GIFS:
+            gif_path = os.path.join(GIF_DIR, random.choice(POLL_INTRO_GIFS))
+            if os.path.isfile(gif_path):
+                with open(gif_path, "rb") as f:
+                    await context.bot.send_animation(
+                        chat_id=UPDATES_CHAT_ID, animation=f, message_thread_id=UPDATES_TOPIC_ID,
+                    )
+                return
+        sticker_path = _random_sticker_path()
+        if sticker_path:
+            with open(sticker_path, "rb") as f:
+                await context.bot.send_sticker(
+                    chat_id=UPDATES_CHAT_ID, sticker=f, message_thread_id=UPDATES_TOPIC_ID,
+                )
+    except Exception as e:
+        logger.warning("Could not send poll lead-in: %s", e)
+
+
 async def post_engagement_poll(context: ContextTypes.DEFAULT_TYPE, reschedule: bool = True, force_static: bool = False) -> None:
     if not UPDATES_CHAT_ID:
         logger.warning("UPDATES_CHAT_ID not set — skipping engagement poll.")
         return
 
-    use_dynamic = not force_static and random.random() < 0.4
+    await _send_poll_lead_in(context)
+
+    # Pick a poll style: trivia quiz, "vote what's next" (dynamic), or a
+    # static preference poll — trivia and dynamic both need TMDB up.
+    roll = random.random() if not force_static else 1.0
+    is_quiz = False
+    correct_option_id = None
     question, options = None, None
 
-    if use_dynamic:
+    if roll < 0.3:
+        trivia = _fetch_trivia_question()
+        if trivia:
+            question, options, correct_option_id = trivia
+            is_quiz = True
+    elif roll < 0.55:
         trending_titles = _fetch_trending_poll_options()
         if trending_titles:
             question, options = "🗳️ Which of these should we upload next?", trending_titles
@@ -866,15 +929,36 @@ async def post_engagement_poll(context: ContextTypes.DEFAULT_TYPE, reschedule: b
     if not question:
         question, options = random.choice(STATIC_POLL_QUESTIONS)
 
+    # Countdown timer on some polls (Telegram shows a live ticking clock)
+    open_period = random.choice([None, None, 600, 1800])  # ~50% chance of a timer
+
     try:
-        await context.bot.send_poll(
+        poll_kwargs = dict(
             chat_id=UPDATES_CHAT_ID,
             question=question,
             options=options,
             is_anonymous=True,
             message_thread_id=UPDATES_TOPIC_ID,
         )
-        logger.info("Posted engagement poll: %r", question)
+        if open_period:
+            poll_kwargs["open_period"] = open_period
+        if is_quiz:
+            poll_kwargs["type"] = "quiz"
+            poll_kwargs["correct_option_id"] = correct_option_id
+
+        sent = await context.bot.send_poll(**poll_kwargs)
+        logger.info("Posted engagement poll (%s): %r", "quiz" if is_quiz else "regular", question)
+
+        # A little auto-reaction to kick things off
+        try:
+            from telegram import ReactionTypeEmoji
+            await context.bot.set_message_reaction(
+                chat_id=UPDATES_CHAT_ID,
+                message_id=sent.message_id,
+                reaction=[ReactionTypeEmoji(emoji=random.choice(["🔥", "🎬", "👀", "🍿"]))],
+            )
+        except Exception as e:
+            logger.warning("Could not auto-react to poll: %s", e)
     except Exception as e:
         logger.error("Failed to post engagement poll: %s", e)
 
