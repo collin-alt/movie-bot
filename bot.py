@@ -702,6 +702,13 @@ async def testannounce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Done — check the Updates topic.")
 
 
+async def testpoll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually fire an engagement poll right now, for testing."""
+    await update.message.reply_text("Posting a poll now, one moment...")
+    await post_engagement_poll(context, reschedule=False)
+    await update.message.reply_text("Done — check the Updates topic.")
+
+
 # ---------------------------------------------------------------------------
 # Daily movie/show announcements (theaters, streaming, trending + trailers)
 # ---------------------------------------------------------------------------
@@ -777,6 +784,15 @@ async def post_daily_announcements(context: ContextTypes.DEFAULT_TYPE, reschedul
     picks = fetch_daily_picks()
     logger.info("Daily announcements: posting %d picks", len(picks))
 
+    if not picks:
+        # TMDB is likely down or returned nothing — keep the topic active
+        # with a poll instead of posting nothing at all.
+        logger.warning("No picks found (TMDB may be down) — posting a fallback poll instead.")
+        await post_engagement_poll(context, reschedule=False, force_static=True)
+        if reschedule:
+            _schedule_next_daily_run(context.application)
+        return
+
     for movie in picks:
         meta = dict(movie)
         meta["media_type"] = "movie"
@@ -810,6 +826,77 @@ async def post_daily_announcements(context: ContextTypes.DEFAULT_TYPE, reschedul
 
     if reschedule:
         _schedule_next_daily_run(context.application)
+
+
+# ---------------------------------------------------------------------------
+# Engagement polls — keep the topic active on quiet days, and as a fallback
+# whenever TMDB doesn't return any daily picks (e.g. the API is down).
+# ---------------------------------------------------------------------------
+
+STATIC_POLL_QUESTIONS = [
+    ("🎬 What are you in the mood for?", ["Action", "Comedy", "Horror", "Romance", "Thriller", "Sci-Fi"]),
+    ("🍿 Which genre should we upload more of?", ["Action", "Drama", "Horror", "Animation", "Crime"]),
+    ("⭐ How would you rate this week's uploads?", ["🔥 Excellent", "👍 Good", "😐 Okay", "👎 Not great"]),
+    ("🎥 Movie night pick — what's the vibe?", ["Something scary", "Something funny", "Something emotional", "Something action-packed"]),
+    ("🌍 Which region's movies do you want more of?", ["Hollywood", "Nollywood", "Bollywood", "Korean", "Local/African"]),
+]
+
+
+def _fetch_trending_poll_options() -> list[str] | None:
+    """Try to build a 'vote for what we upload next' poll using real
+    trending titles. Returns None if TMDB isn't reachable right now."""
+    trending = _tmdb_get(TMDB_TRENDING_URL)
+    titles = [m.get("title") for m in trending if m.get("title")][:5]
+    return titles if len(titles) >= 3 else None
+
+
+async def post_engagement_poll(context: ContextTypes.DEFAULT_TYPE, reschedule: bool = True, force_static: bool = False) -> None:
+    if not UPDATES_CHAT_ID:
+        logger.warning("UPDATES_CHAT_ID not set — skipping engagement poll.")
+        return
+
+    use_dynamic = not force_static and random.random() < 0.4
+    question, options = None, None
+
+    if use_dynamic:
+        trending_titles = _fetch_trending_poll_options()
+        if trending_titles:
+            question, options = "🗳️ Which of these should we upload next?", trending_titles
+
+    if not question:
+        question, options = random.choice(STATIC_POLL_QUESTIONS)
+
+    try:
+        await context.bot.send_poll(
+            chat_id=UPDATES_CHAT_ID,
+            question=question,
+            options=options,
+            is_anonymous=True,
+            message_thread_id=UPDATES_TOPIC_ID,
+        )
+        logger.info("Posted engagement poll: %r", question)
+    except Exception as e:
+        logger.error("Failed to post engagement poll: %s", e)
+
+    if reschedule:
+        _schedule_next_poll_run(context.application)
+
+
+def _schedule_next_poll_run(app: Application) -> None:
+    """Polls run independently of the daily announcements — roughly every
+    1-2 days, at a random time, so the topic stays active between digests."""
+    import datetime
+
+    now = datetime.datetime.now()
+    days_ahead = random.randint(1, 2)
+    target_date = now.date() + datetime.timedelta(days=days_ahead)
+    rand_hour = random.randint(RANDOM_WINDOW_START_HOUR, RANDOM_WINDOW_END_HOUR - 1)
+    rand_minute = random.randint(0, 59)
+    run_at = datetime.datetime.combine(target_date, datetime.time(rand_hour, rand_minute))
+    delay_seconds = (run_at - now).total_seconds()
+
+    app.job_queue.run_once(post_engagement_poll, when=delay_seconds)
+    logger.info("Next engagement poll scheduled for %s (in %.0f minutes)", run_at, delay_seconds / 60)
 
 
 def _schedule_next_daily_run(app: Application) -> None:
@@ -863,6 +950,7 @@ def main():
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("topicid", topicid_cmd))
     app.add_handler(CommandHandler("testannounce", testannounce_cmd))
+    app.add_handler(CommandHandler("testpoll", testpoll_cmd))
     app.add_handler(
         MessageHandler((filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, handle_upload)
     )
@@ -870,6 +958,8 @@ def main():
     # Kick off the first daily announcement at a random time today (if
     # we're still before the window's end) or tomorrow otherwise.
     app.job_queue.run_once(post_daily_announcements, when=_seconds_until_first_run())
+    # Engagement polls run on their own independent schedule.
+    app.job_queue.run_once(post_engagement_poll, when=_seconds_until_first_run() + 3600)
 
     logger.info("Bot started. Listening for uploads...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
