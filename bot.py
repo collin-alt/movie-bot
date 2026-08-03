@@ -756,12 +756,9 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             continue
         name = member.full_name or "there"
         text = (
-            f"👋 Welcome {name} to TRANSLATED MOVIES™️!\n\n"
-            "🍿 New TRANSLATED movies & shows get uploaded regularly across our topics.\n\n"
-            "📌 A few tips:\n"
-            "• /find <title> — check if we've already uploaded something\n"
-            "• /request <title> — ask us to add a movie you want\n\n"
-            "Enjoy! 🎬"
+            f"👋 Welcome {name}!\n\n"
+            "New TRANSLATED movies drop regularly — enjoy! Got a movie "
+            "you want to see? We welcome your requests anytime. 🎬"
         )
         try:
             await msg.reply_text(text)
