@@ -839,16 +839,16 @@ async def request_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def auto_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Any plain (non-command) text message sent in the General Updates
-    topic is treated as a movie request automatically — no /request
-    needed. Note: this means casual chat in that topic also gets
-    forwarded as a "request"."""
+    """Any plain (non-command) text message sent in the General Updates or
+    Special Request topics is treated as a movie request automatically —
+    no /request needed. Note: this means casual chat in those topics also
+    gets forwarded as a "request"."""
     msg = update.effective_message
     if not msg or not msg.text:
         return
     if not UPDATES_CHAT_ID or str(msg.chat_id) != str(UPDATES_CHAT_ID):
         return
-    if msg.message_thread_id != UPDATES_TOPIC_ID:
+    if msg.message_thread_id not in REQUEST_TOPIC_IDS:
         return
     query = msg.text.strip()
     if not query:
@@ -1040,6 +1040,13 @@ async def testpoll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 UPDATES_CHAT_ID = os.getenv("UPDATES_CHAT_ID") or GROUP_CHAT_ID
 UPDATES_TOPIC_ID = os.getenv("UPDATES_TOPIC_ID")
 UPDATES_TOPIC_ID = int(UPDATES_TOPIC_ID) if UPDATES_TOPIC_ID else None
+
+# Auto-request detection (plain text -> forwarded to admin) applies to
+# both the General Updates topic and the Special Request topic.
+SPECIAL_REQUEST_TOPIC_ID = os.getenv("SPECIAL_REQUEST_TOPIC_ID")
+SPECIAL_REQUEST_TOPIC_ID = int(SPECIAL_REQUEST_TOPIC_ID) if SPECIAL_REQUEST_TOPIC_ID else None
+REQUEST_TOPIC_IDS = {UPDATES_TOPIC_ID, SPECIAL_REQUEST_TOPIC_ID}
+
 ANNOUNCEMENTS_PER_DAY = 5
 # Random posting window each day (24h clock, local to the server) — avoids
 # posting in the middle of the night. Adjust if you'd rather it be fully
