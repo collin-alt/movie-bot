@@ -971,6 +971,15 @@ async def check_milestone(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("Could not fetch member count for milestone check: %s", e)
         return
 
+    # If the stats file was just reset (e.g. after a redeploy) and we've
+    # never tracked a milestone before, silently set the baseline to the
+    # CURRENT count instead of 0 — otherwise it would immediately think
+    # every milestone up to the current count needs celebrating again.
+    if "last_milestone" not in _stats:
+        _stats["last_milestone"] = (count // MILESTONE_STEP) * MILESTONE_STEP
+        _save_stats()
+        return
+
     last = _stats.get("last_milestone", 0)
     next_milestone = ((last // MILESTONE_STEP) + 1) * MILESTONE_STEP
 
