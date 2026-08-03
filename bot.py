@@ -812,16 +812,11 @@ async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 
 
-async def request_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = " ".join(context.args).strip() if context.args else ""
-    if not query:
-        await update.message.reply_text("Usage: /request <movie title>")
-        return
-
+async def _forward_request(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
     requester = update.effective_user
     requester_name = requester.full_name if requester else "Someone"
 
-    await update.message.reply_text(f"📥 Got it! Your request for \"{query}\" has been sent to the admin.")
+    await update.effective_message.reply_text(f"📥 Got it! Your request for \"{query}\" has been sent to the admin.")
 
     if ADMIN_USER_ID:
         try:
@@ -833,6 +828,32 @@ async def request_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             logger.warning("Could not DM admin with request (have they started a chat with the bot?): %s", e)
     else:
         logger.warning("ADMIN_USER_ID not set — request from %s for %r was not forwarded.", requester_name, query)
+
+
+async def request_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query:
+        await update.message.reply_text("Usage: /request <movie title>")
+        return
+    await _forward_request(update, context, query)
+
+
+async def auto_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Any plain (non-command) text message sent in the General Updates
+    topic is treated as a movie request automatically — no /request
+    needed. Note: this means casual chat in that topic also gets
+    forwarded as a "request"."""
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    if not UPDATES_CHAT_ID or str(msg.chat_id) != str(UPDATES_CHAT_ID):
+        return
+    if msg.message_thread_id != UPDATES_TOPIC_ID:
+        return
+    query = msg.text.strip()
+    if not query:
+        return
+    await _forward_request(update, context, query)
 
 
 # ---------------------------------------------------------------------------
@@ -1341,6 +1362,7 @@ def main():
     app.add_handler(CommandHandler("testrecap", testrecap_cmd))
     app.add_handler(CommandHandler("find", find_cmd))
     app.add_handler(CommandHandler("request", request_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_request_handler))
     app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     if MessageReactionHandler:
