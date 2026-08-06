@@ -1078,8 +1078,8 @@ def _football_get(path: str, **params) -> dict | None:
 
 
 async def post_football_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bool = True) -> None:
-    """Once a day: upcoming fixtures (next 7 days) + current standings top
-    5 for each of the 5 competitions. Calls are spaced out to stay well
+    """Once a day: upcoming fixtures (next 7 days) + full current standings
+    for each of the 5 competitions. Calls are spaced out to stay well
     under football-data.org's free-tier limit of 10 requests/minute."""
     if not FOOTBALL_CHAT_ID or not FOOTBALL_API_KEY:
         logger.warning("FOOTBALL_CHAT_ID or FOOTBALL_API_KEY not set — skipping football daily digest.")
@@ -1097,27 +1097,28 @@ async def post_football_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bo
         )
         await asyncio.sleep(6.5)  # stay under 10 req/min
 
-        lines = [f"⚽ {name} — Upcoming Fixtures\n"]
-        matches = (data or {}).get("matches", [])[:8]
+        lines = [f"⚽🔥 *{name}* — Upcoming Fixtures 🔥⚽\n"]
+        matches = (data or {}).get("matches", [])[:10]
         if not matches:
-            lines.append("No fixtures in the next 7 days.")
+            lines.append("😴 No fixtures in the next 7 days.")
         else:
             for m in matches:
                 home = m["homeTeam"]["shortName"] or m["homeTeam"]["name"]
                 away = m["awayTeam"]["shortName"] or m["awayTeam"]["name"]
                 dt = m["utcDate"][:16].replace("T", " ")
-                lines.append(f"🗓️ {dt} — {home} vs {away}")
+                lines.append(f"🗓️ {dt}\n🆚 *{home}*  vs  *{away}*\n")
 
         try:
             await context.bot.send_message(
                 chat_id=FOOTBALL_CHAT_ID,
                 text="\n".join(lines),
                 message_thread_id=FOOTBALL_TOPIC_ID,
+                parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
             logger.error("Failed to post fixtures for %s: %s", name, e)
 
-        # --- Standings ---
+        # --- Standings (full table) ---
         standings_data = _football_get(f"/competitions/{code}/standings")
         await asyncio.sleep(6.5)
 
@@ -1128,14 +1129,23 @@ async def post_football_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bo
                 break
 
         if table:
-            lines = [f"🏆 {name} — Table (Top 5)\n"]
-            for row in table[:5]:
-                lines.append(f"{row['position']}. {row['team']['shortName'] or row['team']['name']} — {row['points']} pts")
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}
+            lines = [f"🏆✨ *{name}* — Full Table ✨🏆\n"]
+            lines.append("Pos | Team | P | GD | Pts")
+            for row in table:
+                pos = row["position"]
+                icon = medal.get(pos, f"{pos}.")
+                team = row["team"]["shortName"] or row["team"]["name"]
+                lines.append(
+                    f"{icon} *{team}* — {row['playedGames']}P, GD {row['goalDifference']:+d}, "
+                    f"🔵 {row['points']} pts"
+                )
             try:
                 await context.bot.send_message(
                     chat_id=FOOTBALL_CHAT_ID,
                     text="\n".join(lines),
                     message_thread_id=FOOTBALL_TOPIC_ID,
+                    parse_mode=ParseMode.MARKDOWN,
                 )
             except Exception as e:
                 logger.error("Failed to post standings for %s: %s", name, e)
@@ -1146,19 +1156,14 @@ async def post_football_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bo
         context.application.job_queue.run_once(post_football_daily, when=24 * 3600)
 
 
-async def post_football_news(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """News & transfer headlines via Currents API (production-safe free tier)."""
+async def _post_news_batch(context: ContextTypes.DEFAULT_TYPE, header: str, keywords: str, limit: int = 4) -> None:
     if not FOOTBALL_CHAT_ID or not CURRENTS_API_KEY:
         return
     try:
         resp = requests.get(
             "https://api.currentsapi.services/v1/search",
             headers={"Authorization": CURRENTS_API_KEY},
-            params={
-                "keywords": "Premier League OR Champions League OR La Liga OR Serie A OR Bundesliga transfer",
-                "language": "en",
-                "page_size": 5,
-            },
+            params={"keywords": keywords, "language": "en", "page_size": limit},
             timeout=10,
         )
         resp.raise_for_status()
@@ -1170,19 +1175,75 @@ async def post_football_news(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not articles:
         return
 
-    lines = ["📰 Football News & Transfers\n"]
-    for a in articles[:5]:
-        lines.append(f"🔗 {a.get('title')}\n{a.get('url')}\n")
-
     try:
         await context.bot.send_message(
             chat_id=FOOTBALL_CHAT_ID,
-            text="\n".join(lines),
+            text=header,
             message_thread_id=FOOTBALL_TOPIC_ID,
-            disable_web_page_preview=True,
+            parse_mode=ParseMode.MARKDOWN,
         )
     except Exception as e:
-        logger.error("Failed to post football news: %s", e)
+        logger.error("Failed to post news header: %s", e)
+        return
+
+    for a in articles[:limit]:
+        title = a.get("title") or "Untitled"
+        url = a.get("url") or ""
+        image = a.get("image")
+        # Credit whoever's byline is on the article, falling back to the
+        # publishing domain (e.g. "skysports.com") if no author is given.
+        author = a.get("author")
+        if not author or author.lower() in ("null", "none", ""):
+            try:
+                author = url.split("/")[2].replace("www.", "")
+            except IndexError:
+                author = "Unknown source"
+
+        caption = f"📰 *{title}*\n\n✍️ {author}\n🔗 {url}"
+
+        try:
+            if image and image != "None":
+                await context.bot.send_photo(
+                    chat_id=FOOTBALL_CHAT_ID,
+                    photo=image,
+                    caption=caption,
+                    message_thread_id=FOOTBALL_TOPIC_ID,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=FOOTBALL_CHAT_ID,
+                    text=caption,
+                    message_thread_id=FOOTBALL_TOPIC_ID,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=False,
+                )
+        except Exception as e:
+            logger.warning("Failed to post one news article (falling back to text): %s", e)
+            try:
+                await context.bot.send_message(
+                    chat_id=FOOTBALL_CHAT_ID,
+                    text=caption,
+                    message_thread_id=FOOTBALL_TOPIC_ID,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as e2:
+                logger.error("Failed to post news article at all: %s", e2)
+
+
+async def post_football_news(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """News & transfer headlines via Currents API (production-safe free
+    tier), each with its own image and source credit when available."""
+    await _post_news_batch(
+        context,
+        "📰🔥 *Football News* 🔥📰",
+        "Premier League OR Champions League OR La Liga OR Serie A OR Bundesliga",
+    )
+    await _post_news_batch(
+        context,
+        "🔁💰 *Transfer News* 💰🔁",
+        "football transfer signing deal medical",
+    )
 
 
 async def check_live_football_scores(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1213,7 +1274,8 @@ async def check_live_football_scores(context: ContextTypes.DEFAULT_TYPE) -> None
             try:
                 await context.bot.send_message(
                     chat_id=FOOTBALL_CHAT_ID,
-                    text=f"⚽🔴 LIVE — {competition}\n{home} {home_score} - {away_score} {away}",
+                    text=f"⚽🔴 *LIVE* — {competition}\n\n*{home}* {home_score} - {away_score} *{away}*",
+                    parse_mode=ParseMode.MARKDOWN,
                     message_thread_id=FOOTBALL_TOPIC_ID,
                 )
             except Exception as e:
