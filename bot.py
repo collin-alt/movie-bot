@@ -1040,6 +1040,201 @@ async def testpoll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Football Central — fixtures, live scores, standings, news & transfers
+# for EPL, La Liga, Serie A, Bundesliga, and Champions League.
+# ---------------------------------------------------------------------------
+
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
+CURRENTS_API_KEY = os.getenv("CURRENTS_API_KEY")
+FOOTBALL_CHAT_ID = os.getenv("FOOTBALL_CHAT_ID") or GROUP_CHAT_ID
+FOOTBALL_TOPIC_ID = os.getenv("FOOTBALL_TOPIC_ID")
+FOOTBALL_TOPIC_ID = int(FOOTBALL_TOPIC_ID) if FOOTBALL_TOPIC_ID else None
+
+FOOTBALL_API_BASE = "https://api.football-data.org/v4"
+COMPETITIONS = {
+    "PL": "Premier League",
+    "PD": "La Liga",
+    "SA": "Serie A",
+    "BL1": "Bundesliga",
+    "CL": "Champions League",
+}
+
+
+def _football_get(path: str, **params) -> dict | None:
+    if not FOOTBALL_API_KEY:
+        return None
+    try:
+        resp = requests.get(
+            f"{FOOTBALL_API_BASE}{path}",
+            headers={"X-Auth-Token": FOOTBALL_API_KEY},
+            params=params,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as e:
+        logger.warning("football-data.org request failed (%s): %s", path, e)
+        return None
+
+
+async def post_football_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bool = True) -> None:
+    """Once a day: upcoming fixtures (next 7 days) + current standings top
+    5 for each of the 5 competitions. Calls are spaced out to stay well
+    under football-data.org's free-tier limit of 10 requests/minute."""
+    if not FOOTBALL_CHAT_ID or not FOOTBALL_API_KEY:
+        logger.warning("FOOTBALL_CHAT_ID or FOOTBALL_API_KEY not set — skipping football daily digest.")
+        return
+
+    import datetime
+    today = datetime.date.today()
+    date_to = today + datetime.timedelta(days=7)
+
+    for code, name in COMPETITIONS.items():
+        # --- Fixtures ---
+        data = _football_get(
+            f"/competitions/{code}/matches",
+            dateFrom=today.isoformat(), dateTo=date_to.isoformat(),
+        )
+        await asyncio.sleep(6.5)  # stay under 10 req/min
+
+        lines = [f"⚽ {name} — Upcoming Fixtures\n"]
+        matches = (data or {}).get("matches", [])[:8]
+        if not matches:
+            lines.append("No fixtures in the next 7 days.")
+        else:
+            for m in matches:
+                home = m["homeTeam"]["shortName"] or m["homeTeam"]["name"]
+                away = m["awayTeam"]["shortName"] or m["awayTeam"]["name"]
+                dt = m["utcDate"][:16].replace("T", " ")
+                lines.append(f"🗓️ {dt} — {home} vs {away}")
+
+        try:
+            await context.bot.send_message(
+                chat_id=FOOTBALL_CHAT_ID,
+                text="\n".join(lines),
+                message_thread_id=FOOTBALL_TOPIC_ID,
+            )
+        except Exception as e:
+            logger.error("Failed to post fixtures for %s: %s", name, e)
+
+        # --- Standings ---
+        standings_data = _football_get(f"/competitions/{code}/standings")
+        await asyncio.sleep(6.5)
+
+        table = None
+        for group in (standings_data or {}).get("standings", []):
+            if group.get("type") == "TOTAL":
+                table = group.get("table")
+                break
+
+        if table:
+            lines = [f"🏆 {name} — Table (Top 5)\n"]
+            for row in table[:5]:
+                lines.append(f"{row['position']}. {row['team']['shortName'] or row['team']['name']} — {row['points']} pts")
+            try:
+                await context.bot.send_message(
+                    chat_id=FOOTBALL_CHAT_ID,
+                    text="\n".join(lines),
+                    message_thread_id=FOOTBALL_TOPIC_ID,
+                )
+            except Exception as e:
+                logger.error("Failed to post standings for %s: %s", name, e)
+
+    await post_football_news(context)
+
+    if reschedule:
+        context.application.job_queue.run_once(post_football_daily, when=24 * 3600)
+
+
+async def post_football_news(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """News & transfer headlines via Currents API (production-safe free tier)."""
+    if not FOOTBALL_CHAT_ID or not CURRENTS_API_KEY:
+        return
+    try:
+        resp = requests.get(
+            "https://api.currentsapi.services/v1/search",
+            headers={"Authorization": CURRENTS_API_KEY},
+            params={
+                "keywords": "Premier League OR Champions League OR La Liga OR Serie A OR Bundesliga transfer",
+                "language": "en",
+                "page_size": 5,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        articles = resp.json().get("news", [])
+    except requests.RequestException as e:
+        logger.warning("Currents API request failed: %s", e)
+        return
+
+    if not articles:
+        return
+
+    lines = ["📰 Football News & Transfers\n"]
+    for a in articles[:5]:
+        lines.append(f"🔗 {a.get('title')}\n{a.get('url')}\n")
+
+    try:
+        await context.bot.send_message(
+            chat_id=FOOTBALL_CHAT_ID,
+            text="\n".join(lines),
+            message_thread_id=FOOTBALL_TOPIC_ID,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error("Failed to post football news: %s", e)
+
+
+async def check_live_football_scores(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs every 15 min: one single call covers ALL live matches across
+    every competition, filtered down to our 5. Posts an update only when
+    a tracked match's score has actually changed since the last check."""
+    if not FOOTBALL_CHAT_ID or not FOOTBALL_API_KEY:
+        return
+
+    data = _football_get("/matches", status="LIVE")
+    matches = (data or {}).get("matches", [])
+    our_matches = [m for m in matches if m.get("competition", {}).get("code") in COMPETITIONS]
+
+    live_state = _stats.setdefault("live_matches", {})
+
+    for m in our_matches:
+        match_id = str(m["id"])
+        home = m["homeTeam"]["shortName"] or m["homeTeam"]["name"]
+        away = m["awayTeam"]["shortName"] or m["awayTeam"]["name"]
+        score = m.get("score", {}).get("fullTime", {})
+        home_score = score.get("home")
+        away_score = score.get("away")
+        current = f"{home_score}-{away_score}"
+
+        if live_state.get(match_id) != current:
+            live_state[match_id] = current
+            competition = COMPETITIONS.get(m.get("competition", {}).get("code"), "")
+            try:
+                await context.bot.send_message(
+                    chat_id=FOOTBALL_CHAT_ID,
+                    text=f"⚽🔴 LIVE — {competition}\n{home} {home_score} - {away_score} {away}",
+                    message_thread_id=FOOTBALL_TOPIC_ID,
+                )
+            except Exception as e:
+                logger.error("Failed to post live score update: %s", e)
+
+    # Clean up finished matches no longer in the live list
+    live_ids_now = {str(m["id"]) for m in our_matches}
+    for old_id in list(live_state.keys()):
+        if old_id not in live_ids_now:
+            live_state.pop(old_id, None)
+
+    _save_stats()
+
+
+async def testfootball_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Posting football fixtures, standings, and news now — this takes a minute...")
+    await post_football_daily(context, reschedule=False)
+    await update.message.reply_text("Done — check Football Central.")
+
+
+# ---------------------------------------------------------------------------
 # Daily movie/show announcements (theaters, streaming, trending + trailers)
 # ---------------------------------------------------------------------------
 
@@ -1377,6 +1572,7 @@ def main():
     app.add_handler(CommandHandler("request", request_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_request_handler))
     app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
+    app.add_handler(CommandHandler("testfootball", testfootball_cmd))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     if MessageReactionHandler:
         app.add_handler(MessageReactionHandler(track_reaction))
@@ -1395,6 +1591,10 @@ def main():
     app.job_queue.run_once(post_weekly_recap, when=7 * 24 * 3600)
     # Milestone check, every 6 hours.
     app.job_queue.run_repeating(check_milestone, interval=MILESTONE_CHECK_INTERVAL, first=60)
+    # Football: daily fixtures/standings/news digest, ~2 hours after startup.
+    app.job_queue.run_once(post_football_daily, when=7200)
+    # Football: live score checks every 15 minutes.
+    app.job_queue.run_repeating(check_live_football_scores, interval=900, first=120)
 
     logger.info("Bot started. Listening for uploads...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
