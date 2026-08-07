@@ -1129,21 +1129,21 @@ async def post_football_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bo
                 break
 
         if table:
-            medal = {1: "🥇", 2: "🥈", 3: "🥉"}
-            lines = [f"🏆✨ *{name}* — Full Table ✨🏆\n"]
-            lines.append("Pos | Team | P | GD | Pts")
+            header = f"{'#':<3}{'Team':<18}{'P':>3}{'W':>3}{'D':>3}{'L':>3}{'GD':>5}{'Pts':>5}"
+            rows = [header, "-" * len(header)]
             for row in table:
-                pos = row["position"]
-                icon = medal.get(pos, f"{pos}.")
-                team = row["team"]["shortName"] or row["team"]["name"]
-                lines.append(
-                    f"{icon} *{team}* — {row['playedGames']}P, GD {row['goalDifference']:+d}, "
-                    f"🔵 {row['points']} pts"
+                team = (row["team"]["shortName"] or row["team"]["name"])[:17]
+                gd = row["goalDifference"]
+                rows.append(
+                    f"{row['position']:<3}{team:<18}{row['playedGames']:>3}{row['won']:>3}"
+                    f"{row['draw']:>3}{row['lost']:>3}{gd:>+5}{row['points']:>5}"
                 )
+            table_block = "```\n" + "\n".join(rows) + "\n```"
+            text = f"🏆✨ *{name}* — Full Table ✨🏆\n\n{table_block}"
             try:
                 await context.bot.send_message(
                     chat_id=FOOTBALL_CHAT_ID,
-                    text="\n".join(lines),
+                    text=text,
                     message_thread_id=FOOTBALL_TOPIC_ID,
                     parse_mode=ParseMode.MARKDOWN,
                 )
@@ -1158,7 +1158,12 @@ async def post_football_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bo
 
 async def _post_news_batch(context: ContextTypes.DEFAULT_TYPE, header: str, keywords: str, limit: int = 4) -> None:
     if not FOOTBALL_CHAT_ID or not CURRENTS_API_KEY:
+        logger.warning(
+            "Skipping news batch %r — FOOTBALL_CHAT_ID set: %s, CURRENTS_API_KEY set: %s",
+            header, bool(FOOTBALL_CHAT_ID), bool(CURRENTS_API_KEY),
+        )
         return
+    logger.info("Fetching news batch: %r (keywords=%r)", header, keywords)
     try:
         resp = requests.get(
             "https://api.currentsapi.services/v1/search",
@@ -1173,8 +1178,10 @@ async def _post_news_batch(context: ContextTypes.DEFAULT_TYPE, header: str, keyw
         return
 
     if not articles:
+        logger.warning("Currents API returned 0 articles for keywords=%r", keywords)
         return
 
+    logger.info("Currents API returned %d articles for %r", len(articles), header)
     try:
         await context.bot.send_message(
             chat_id=FOOTBALL_CHAT_ID,
