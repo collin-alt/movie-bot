@@ -1077,6 +1077,82 @@ def _football_get(path: str, **params) -> dict | None:
         return None
 
 
+def render_standings_image(table: list[dict], competition_name: str) -> bytes | None:
+    """Render the standings as an actual graphic — real club crests
+    (provided by football-data.org's API, same legitimacy as pulling TMDB
+    posters), bold headers, colored zone bars for top spots/relegation."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        from io import BytesIO
+
+        row_h, header_h, title_h = 56, 60, 84
+        W = 860
+        H = title_h + header_h + row_h * len(table) + 16
+
+        img = Image.new("RGB", (W, H), (16, 16, 24))
+        draw = ImageDraw.Draw(img)
+
+        title_font = ImageFont.truetype(FONT_PATH, 32)
+        header_font = ImageFont.truetype(FONT_PATH, 18)
+        row_font = ImageFont.truetype(FONT_PATH, 21)
+
+        # Title banner
+        draw.rectangle([0, 0, W, title_h], fill=(38, 20, 62))
+        draw.text((28, 24), f"🏆 {competition_name} — Full Table", font=title_font, fill=(255, 210, 70))
+
+        # Header row
+        y = title_h
+        draw.rectangle([0, y, W, y + header_h], fill=(26, 26, 38))
+        cols = [("#", 26), ("Team", 140), ("P", 480), ("W", 540), ("D", 590), ("L", 640), ("GD", 700), ("Pts", 780)]
+        for text, x in cols:
+            draw.text((x, y + 20), text, font=header_font, fill=(170, 170, 195))
+
+        y += header_h
+        total = len(table)
+        for i, row in enumerate(table):
+            pos = row["position"]
+            zone_color = None
+            if pos <= 4:
+                zone_color = (34, 150, 70)
+            elif pos > total - 3:
+                zone_color = (180, 45, 45)
+
+            row_bg = (22, 22, 32) if i % 2 == 0 else (28, 28, 40)
+            draw.rectangle([0, y, W, y + row_h], fill=row_bg)
+            if zone_color:
+                draw.rectangle([0, y, 7, y + row_h], fill=zone_color)
+
+            draw.text((26, y + 16), str(pos), font=row_font, fill=(255, 255, 255))
+
+            crest_url = row["team"].get("crest")
+            if crest_url:
+                try:
+                    r = requests.get(crest_url, timeout=5)
+                    crest = Image.open(BytesIO(r.content)).convert("RGBA")
+                    crest = crest.resize((34, 34))
+                    img.paste(crest, (85, y + 11), crest)
+                except Exception:
+                    pass
+
+            team = (row["team"]["shortName"] or row["team"]["name"])[:22]
+            draw.text((140, y + 16), team, font=row_font, fill=(240, 240, 245))
+            draw.text((480, y + 16), str(row["playedGames"]), font=row_font, fill=(200, 200, 210))
+            draw.text((540, y + 16), str(row["won"]), font=row_font, fill=(200, 200, 210))
+            draw.text((590, y + 16), str(row["draw"]), font=row_font, fill=(200, 200, 210))
+            draw.text((640, y + 16), str(row["lost"]), font=row_font, fill=(200, 200, 210))
+            draw.text((700, y + 16), f"{row['goalDifference']:+d}", font=row_font, fill=(200, 200, 210))
+            draw.text((780, y + 16), str(row["points"]), font=row_font, fill=(255, 221, 0))
+
+            y += row_h
+
+        out = BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+    except Exception as e:
+        logger.warning("Could not render standings image: %s", e)
+        return None
+
+
 async def post_football_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bool = True) -> None:
     """Once a day: upcoming fixtures (next 7 days) + full current standings
     for each of the 5 competitions. Calls are spaced out to stay well
@@ -1129,26 +1205,38 @@ async def post_football_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bo
                 break
 
         if table:
-            header = f"{'#':<3}{'Team':<18}{'P':>3}{'W':>3}{'D':>3}{'L':>3}{'GD':>5}{'Pts':>5}"
-            rows = [header, "-" * len(header)]
-            for row in table:
-                team = (row["team"]["shortName"] or row["team"]["name"])[:17]
-                gd = row["goalDifference"]
-                rows.append(
-                    f"{row['position']:<3}{team:<18}{row['playedGames']:>3}{row['won']:>3}"
-                    f"{row['draw']:>3}{row['lost']:>3}{gd:>+5}{row['points']:>5}"
-                )
-            table_block = "```\n" + "\n".join(rows) + "\n```"
-            text = f"🏆✨ *{name}* — Full Table ✨🏆\n\n{table_block}"
-            try:
-                await context.bot.send_message(
-                    chat_id=FOOTBALL_CHAT_ID,
-                    text=text,
-                    message_thread_id=FOOTBALL_TOPIC_ID,
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            except Exception as e:
-                logger.error("Failed to post standings for %s: %s", name, e)
+            image_bytes = render_standings_image(table, name)
+            if image_bytes:
+                try:
+                    await context.bot.send_photo(
+                        chat_id=FOOTBALL_CHAT_ID,
+                        photo=image_bytes,
+                        caption=f"🏆✨ *{name}* — Full Table ✨🏆",
+                        message_thread_id=FOOTBALL_TOPIC_ID,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception as e:
+                    logger.error("Failed to post standings image for %s: %s", name, e)
+            else:
+                # Fallback: plain monospace text table if image rendering failed
+                header = f"{'#':<3}{'Team':<18}{'P':>3}{'W':>3}{'D':>3}{'L':>3}{'GD':>5}{'Pts':>5}"
+                rows = [header, "-" * len(header)]
+                for row in table:
+                    team = (row["team"]["shortName"] or row["team"]["name"])[:17]
+                    rows.append(
+                        f"{row['position']:<3}{team:<18}{row['playedGames']:>3}{row['won']:>3}"
+                        f"{row['draw']:>3}{row['lost']:>3}{row['goalDifference']:>+5}{row['points']:>5}"
+                    )
+                table_block = "```\n" + "\n".join(rows) + "\n```"
+                try:
+                    await context.bot.send_message(
+                        chat_id=FOOTBALL_CHAT_ID,
+                        text=f"🏆✨ *{name}* — Full Table ✨🏆\n\n{table_block}",
+                        message_thread_id=FOOTBALL_TOPIC_ID,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception as e:
+                    logger.error("Failed to post standings text for %s: %s", name, e)
 
     await post_football_news(context)
 
