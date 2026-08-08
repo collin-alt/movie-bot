@@ -1077,10 +1077,12 @@ def _football_get(path: str, **params) -> dict | None:
         return None
 
 
-def render_standings_image(table: list[dict], competition_name: str) -> bytes | None:
+def render_standings_image(table: list[dict], competition_name: str, competition_code: str = "") -> bytes | None:
     """Render the standings as an actual graphic — real club crests
     (provided by football-data.org's API, same legitimacy as pulling TMDB
-    posters), bold headers, colored zone bars for top spots/relegation."""
+    posters), bold headers, colored zone bars: green = Champions League,
+    orange = Europa League, red = relegation. Zone bars are skipped for
+    Champions League itself, which doesn't have this domestic structure."""
     try:
         from PIL import Image, ImageDraw, ImageFont
         from io import BytesIO
@@ -1109,13 +1111,17 @@ def render_standings_image(table: list[dict], competition_name: str) -> bytes | 
 
         y += header_h
         total = len(table)
+        show_zones = competition_code != "CL"
         for i, row in enumerate(table):
             pos = row["position"]
             zone_color = None
-            if pos <= 4:
-                zone_color = (34, 150, 70)
-            elif pos > total - 3:
-                zone_color = (180, 45, 45)
+            if show_zones:
+                if pos <= 4:
+                    zone_color = (34, 150, 70)      # Champions League
+                elif pos in (5, 6):
+                    zone_color = (230, 150, 30)      # Europa / Conference League
+                elif pos > total - 3:
+                    zone_color = (180, 45, 45)       # Relegation
 
             row_bg = (22, 22, 32) if i % 2 == 0 else (28, 28, 40)
             draw.rectangle([0, y, W, y + row_h], fill=row_bg)
@@ -1153,6 +1159,82 @@ def render_standings_image(table: list[dict], competition_name: str) -> bytes | 
         return None
 
 
+def _to_eat(utc_str: str):
+    """Convert a football-data.org UTC timestamp to East Africa Time (UTC+3)."""
+    import datetime as dt
+    d = dt.datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+    return d + dt.timedelta(hours=3)
+
+
+def render_fixtures_image(matches: list[dict], competition_name: str) -> bytes | None:
+    """Render upcoming fixtures grouped by date, times converted to EAT,
+    with real club crests — similar layout to FotMob's fixtures view."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        from io import BytesIO
+
+        groups: dict[str, list] = {}
+        for m in matches:
+            eat = _to_eat(m["utcDate"])
+            key = eat.strftime("%A, %d %B")
+            groups.setdefault(key, []).append((eat, m))
+
+        row_h, date_header_h, title_h = 54, 44, 84
+        W = 820
+        total_rows = sum(len(v) for v in groups.values())
+        H = title_h + date_header_h * len(groups) + row_h * total_rows + 16
+
+        img = Image.new("RGB", (W, H), (16, 16, 24))
+        draw = ImageDraw.Draw(img)
+        title_font = ImageFont.truetype(FONT_PATH, 30)
+        date_font = ImageFont.truetype(FONT_PATH, 19)
+        team_font = ImageFont.truetype(FONT_PATH, 19)
+        time_font = ImageFont.truetype(FONT_PATH, 18)
+
+        draw.rectangle([0, 0, W, title_h], fill=(38, 20, 62))
+        draw.text((26, 24), f"📅 {competition_name} — Fixtures (EAT)", font=title_font, fill=(255, 210, 70))
+
+        y = title_h
+        for date_key, items in groups.items():
+            draw.rectangle([0, y, W, y + date_header_h], fill=(30, 30, 45))
+            draw.text((26, y + 10), date_key, font=date_font, fill=(200, 200, 220))
+            y += date_header_h
+
+            for i, (eat, m) in enumerate(items):
+                row_bg = (22, 22, 32) if i % 2 == 0 else (26, 26, 36)
+                draw.rectangle([0, y, W, y + row_h], fill=row_bg)
+
+                home = m["homeTeam"]["shortName"] or m["homeTeam"]["name"]
+                away = m["awayTeam"]["shortName"] or m["awayTeam"]["name"]
+                time_str = eat.strftime("%H:%M")
+
+                for side, x_crest in [("homeTeam", 26), ("awayTeam", 560)]:
+                    crest_url = m[side].get("crest")
+                    if crest_url:
+                        try:
+                            r = requests.get(crest_url, timeout=5)
+                            crest = Image.open(BytesIO(r.content)).convert("RGBA")
+                            crest = crest.resize((30, 30))
+                            img.paste(crest, (x_crest, y + 12), crest)
+                        except Exception:
+                            pass
+
+                draw.text((66, y + 16), home[:16], font=team_font, fill=(240, 240, 245))
+                bbox = draw.textbbox((0, 0), time_str, font=time_font)
+                tw = bbox[2] - bbox[0]
+                draw.text((W / 2 - tw / 2, y + 17), time_str, font=time_font, fill=(255, 210, 70))
+                draw.text((600, y + 16), away[:16], font=team_font, fill=(240, 240, 245))
+
+                y += row_h
+
+        out = BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+    except Exception as e:
+        logger.warning("Could not render fixtures image: %s", e)
+        return None
+
+
 async def post_football_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bool = True) -> None:
     """Once a day: upcoming fixtures (next 7 days) + full current standings
     for each of the 5 competitions. Calls are spaced out to stay well
@@ -1166,33 +1248,53 @@ async def post_football_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bo
     date_to = today + datetime.timedelta(days=7)
 
     for code, name in COMPETITIONS.items():
-        # --- Fixtures ---
+        # --- Fixtures (rendered as an image, grouped by date, EAT times) ---
         data = _football_get(
             f"/competitions/{code}/matches",
             dateFrom=today.isoformat(), dateTo=date_to.isoformat(),
         )
         await asyncio.sleep(6.5)  # stay under 10 req/min
 
-        lines = [f"⚽🔥 *{name}* — Upcoming Fixtures 🔥⚽\n"]
-        matches = (data or {}).get("matches", [])[:10]
-        if not matches:
-            lines.append("😴 No fixtures in the next 7 days.")
+        matches = (data or {}).get("matches", [])[:15]
+        if matches:
+            image_bytes = render_fixtures_image(matches, name)
+            if image_bytes:
+                try:
+                    await context.bot.send_photo(
+                        chat_id=FOOTBALL_CHAT_ID,
+                        photo=image_bytes,
+                        caption=f"⚽🔥 *{name}* — Upcoming Fixtures 🔥⚽",
+                        message_thread_id=FOOTBALL_TOPIC_ID,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception as e:
+                    logger.error("Failed to post fixtures image for %s: %s", name, e)
+            else:
+                lines = [f"⚽🔥 *{name}* — Upcoming Fixtures 🔥⚽\n"]
+                for m in matches:
+                    home = m["homeTeam"]["shortName"] or m["homeTeam"]["name"]
+                    away = m["awayTeam"]["shortName"] or m["awayTeam"]["name"]
+                    eat = _to_eat(m["utcDate"])
+                    lines.append(f"🗓️ {eat.strftime('%a %d %b, %H:%M')} EAT\n🆚 *{home}*  vs  *{away}*\n")
+                try:
+                    await context.bot.send_message(
+                        chat_id=FOOTBALL_CHAT_ID,
+                        text="\n".join(lines),
+                        message_thread_id=FOOTBALL_TOPIC_ID,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception as e:
+                    logger.error("Failed to post fixtures text for %s: %s", name, e)
         else:
-            for m in matches:
-                home = m["homeTeam"]["shortName"] or m["homeTeam"]["name"]
-                away = m["awayTeam"]["shortName"] or m["awayTeam"]["name"]
-                dt = m["utcDate"][:16].replace("T", " ")
-                lines.append(f"🗓️ {dt}\n🆚 *{home}*  vs  *{away}*\n")
-
-        try:
-            await context.bot.send_message(
-                chat_id=FOOTBALL_CHAT_ID,
-                text="\n".join(lines),
-                message_thread_id=FOOTBALL_TOPIC_ID,
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception as e:
-            logger.error("Failed to post fixtures for %s: %s", name, e)
+            try:
+                await context.bot.send_message(
+                    chat_id=FOOTBALL_CHAT_ID,
+                    text=f"⚽ *{name}* — 😴 No fixtures in the next 7 days.",
+                    message_thread_id=FOOTBALL_TOPIC_ID,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as e:
+                logger.error("Failed to post empty-fixtures notice for %s: %s", name, e)
 
         # --- Standings (full table) ---
         standings_data = _football_get(f"/competitions/{code}/standings")
@@ -1205,7 +1307,7 @@ async def post_football_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bo
                 break
 
         if table:
-            image_bytes = render_standings_image(table, name)
+            image_bytes = render_standings_image(table, name, code)
             if image_bytes:
                 try:
                     await context.bot.send_photo(
@@ -1383,6 +1485,104 @@ async def check_live_football_scores(context: ContextTypes.DEFAULT_TYPE) -> None
             live_state.pop(old_id, None)
 
     _save_stats()
+
+
+async def fetch_top_scorers_text(code: str, name: str) -> str | None:
+    data = _football_get(f"/competitions/{code}/scorers", limit=5)
+    scorers = (data or {}).get("scorers", [])
+    if not scorers:
+        return None
+    lines = [f"⚡🥅 *{name}* — Top Scorers 🥅⚡\n"]
+    medal = ["🥇", "🥈", "🥉"]
+    for i, s in enumerate(scorers[:5]):
+        icon = medal[i] if i < 3 else f"{i + 1}."
+        player = s.get("player", {}).get("name", "Unknown")
+        team = s.get("team", {}).get("shortName") or s.get("team", {}).get("name", "")
+        goals = s.get("goals", 0)
+        lines.append(f"{icon} *{player}* ({team}) — {goals} goals")
+    return "\n".join(lines)
+
+
+async def post_gameweek_recap(context: ContextTypes.DEFAULT_TYPE, code: str, name: str, matchday: int) -> None:
+    """Fires automatically once a competition's current matchday is fully
+    finished: posts the fresh standings, top scorers, and news — a
+    lighter version of the daily digest, triggered by real results
+    instead of the clock."""
+    await context.bot.send_message(
+        chat_id=FOOTBALL_CHAT_ID,
+        text=f"✅🏁 *{name}* — Matchday {matchday} complete! Here's the latest:",
+        message_thread_id=FOOTBALL_TOPIC_ID,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    standings_data = _football_get(f"/competitions/{code}/standings")
+    await asyncio.sleep(6.5)
+    table = None
+    for group in (standings_data or {}).get("standings", []):
+        if group.get("type") == "TOTAL":
+            table = group.get("table")
+            break
+    if table:
+        image_bytes = render_standings_image(table, name, code)
+        if image_bytes:
+            try:
+                await context.bot.send_photo(
+                    chat_id=FOOTBALL_CHAT_ID,
+                    photo=image_bytes,
+                    caption=f"🏆 *{name}* — Updated Table",
+                    message_thread_id=FOOTBALL_TOPIC_ID,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as e:
+                logger.error("Failed to post gameweek standings for %s: %s", name, e)
+
+    scorers_text = await fetch_top_scorers_text(code, name)
+    await asyncio.sleep(6.5)
+    if scorers_text:
+        try:
+            await context.bot.send_message(
+                chat_id=FOOTBALL_CHAT_ID,
+                text=scorers_text,
+                message_thread_id=FOOTBALL_TOPIC_ID,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as e:
+            logger.error("Failed to post top scorers for %s: %s", name, e)
+
+    await post_football_news(context)
+
+
+async def check_gameweek_completion(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs every few hours: checks each domestic competition (Champions
+    League is skipped — its league-phase format doesn't map cleanly to a
+    weekly 'matchday' the same way) for whether the latest matchday just
+    finished, and if so, fires the auto gameweek recap exactly once."""
+    if not FOOTBALL_CHAT_ID or not FOOTBALL_API_KEY:
+        return
+
+    for code, name in COMPETITIONS.items():
+        if code == "CL":
+            continue
+
+        finished_data = _football_get(f"/competitions/{code}/matches", status="FINISHED")
+        await asyncio.sleep(6.5)
+        finished_matches = (finished_data or {}).get("matches", [])
+        matchdays = [m.get("matchday") for m in finished_matches if m.get("matchday")]
+        if not matchdays:
+            continue
+        latest_md = max(matchdays)
+
+        already_announced = _stats.get(f"announced_gw:{code}")
+        if already_announced == latest_md:
+            continue
+
+        md_data = _football_get(f"/competitions/{code}/matches", matchday=latest_md)
+        await asyncio.sleep(6.5)
+        md_matches = (md_data or {}).get("matches", [])
+        if md_matches and all(m.get("status") == "FINISHED" for m in md_matches):
+            _stats[f"announced_gw:{code}"] = latest_md
+            _save_stats()
+            await post_gameweek_recap(context, code, name, latest_md)
 
 
 async def testfootball_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1752,6 +1952,8 @@ def main():
     app.job_queue.run_once(post_football_daily, when=7200)
     # Football: live score checks every 15 minutes.
     app.job_queue.run_repeating(check_live_football_scores, interval=900, first=120)
+    # Football: gameweek completion check every 3 hours.
+    app.job_queue.run_repeating(check_gameweek_completion, interval=3 * 3600, first=300)
 
     logger.info("Bot started. Listening for uploads...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
