@@ -1633,7 +1633,8 @@ def _tmdb_get(url: str, **params) -> list[dict]:
 
 def fetch_daily_picks() -> list[dict]:
     """Pull a diverse mix: trending, in theaters, and new-to-streaming,
-    deduped by movie ID, capped at ANNOUNCEMENTS_PER_DAY."""
+    deduped by movie ID both within this run AND against everything
+    already announced on previous days, capped at ANNOUNCEMENTS_PER_DAY."""
     trending = _tmdb_get(TMDB_TRENDING_URL)
     theaters = _tmdb_get(TMDB_NOW_PLAYING_URL, region="US")
     streaming = _tmdb_get(
@@ -1642,16 +1643,26 @@ def fetch_daily_picks() -> list[dict]:
         **{"release_date.lte": __import__("datetime").date.today().isoformat()},
     )
 
+    already_announced = set(_stats.get("announced_movie_ids", []))
     picks, seen_ids = [], set()
     for pool in (trending, theaters, streaming):
         for movie in pool:
-            if movie["id"] in seen_ids:
+            if movie["id"] in seen_ids or movie["id"] in already_announced:
                 continue
             seen_ids.add(movie["id"])
             picks.append(movie)
             if len(picks) >= ANNOUNCEMENTS_PER_DAY:
                 return picks
     return picks
+
+
+def _mark_movie_announced(movie_id: int) -> None:
+    announced = _stats.setdefault("announced_movie_ids", [])
+    if movie_id not in announced:
+        announced.append(movie_id)
+    if len(announced) > 1000:
+        _stats["announced_movie_ids"] = announced[-1000:]
+    _save_stats()
 
 
 def fetch_trailer_url(movie_id: int) -> str | None:
@@ -1710,6 +1721,7 @@ async def post_daily_announcements(context: ContextTypes.DEFAULT_TYPE, reschedul
                     text=f"🎞️ Trailer: {trailer_url}",
                     message_thread_id=UPDATES_TOPIC_ID,
                 )
+            _mark_movie_announced(movie["id"])
         except Exception as e:
             logger.error("Failed to post daily announcement for %s: %s", movie.get("title"), e)
 
@@ -1927,10 +1939,8 @@ def main():
     app.add_handler(CommandHandler("testrecap", testrecap_cmd))
     app.add_handler(CommandHandler("find", find_cmd))
     app.add_handler(CommandHandler("request", request_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_request_handler))
     app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
     app.add_handler(CommandHandler("testfootball", testfootball_cmd))
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     if MessageReactionHandler:
         app.add_handler(MessageReactionHandler(track_reaction))
     else:
@@ -1944,10 +1954,6 @@ def main():
     app.job_queue.run_once(post_daily_announcements, when=_seconds_until_first_run())
     # Engagement polls run on their own independent schedule.
     app.job_queue.run_once(post_engagement_poll, when=_seconds_until_first_run() + 3600)
-    # Weekly recap, 7 days from now.
-    app.job_queue.run_once(post_weekly_recap, when=7 * 24 * 3600)
-    # Milestone check, every 6 hours.
-    app.job_queue.run_repeating(check_milestone, interval=MILESTONE_CHECK_INTERVAL, first=60)
     # Football: daily fixtures/standings/news digest, ~2 hours after startup.
     app.job_queue.run_once(post_football_daily, when=7200)
     # Football: live score checks every 15 minutes.
