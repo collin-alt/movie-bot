@@ -334,20 +334,28 @@ def extract_vj_credit(text: str) -> str | None:
     return "Vj " + match.group(1).title()
 
 
-def clean_title(filename: str) -> tuple[str, str | None, bool]:
-    """Extract a probable (title, year, is_series) triple from a release
-    filename or caption. is_series is True only if the raw text actually
-    contains an episode/season marker (S01E02, Episode 3, Season 2...) —
-    used so a plain title with no such marker searches movies only,
-    instead of risking a match against an unrelated TV show of the same
-    name."""
+def clean_title(filename: str) -> tuple[str, str | None, bool, int | None]:
+    """Extract a probable (title, year, is_series, episode_num) from a
+    release filename or caption. is_series is True only if the raw text
+    actually contains an episode/season marker (S01E02, Episode 3,
+    Season 2, or a bare trailing number...). episode_num is the actual
+    episode number found in the source when available — preferred over
+    auto-incrementing our own counter, so a deleted-and-re-uploaded
+    episode 8 still shows as "8", not whatever the next count would be."""
     # Only look at the first non-empty line. Multi-line captions from
     # source channels are almost always: [title line] + [promo/spam block].
     first_line = next((ln for ln in filename.splitlines() if ln.strip()), filename)
 
+    episode_num = None
+    se_match = re.search(r"\bs\d{1,2}[.\s]*e(\d{1,3})\b", first_line, re.IGNORECASE)
+    ep_match = re.search(r"\b(?:episode|ep)\.?\s*(\d+)\b", first_line, re.IGNORECASE)
+    if se_match:
+        episode_num = int(se_match.group(1))
+    elif ep_match:
+        episode_num = int(ep_match.group(1))
+
     is_series = bool(
-        re.search(r"\bs\d{1,2}[.\s]*e\d{1,3}\b", first_line, re.IGNORECASE)
-        or re.search(r"\b(episode|ep)\.?\s*\d+\b", first_line, re.IGNORECASE)
+        se_match or ep_match
         or re.search(r"\bseason\s*\d+\b", first_line, re.IGNORECASE)
     )
 
@@ -404,9 +412,10 @@ def clean_title(filename: str) -> tuple[str, str | None, bool]:
         trailing_num = re.search(r"\s(\d{1,2})$", name)
         if trailing_num:
             is_series = True
+            episode_num = int(trailing_num.group(1))
             name = name[: trailing_num.start()].strip(" -_")
 
-    return name, year, is_series
+    return name, year, is_series, episode_num
 
 
 # ---------------------------------------------------------------------------
@@ -599,12 +608,13 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
 
     meta = None
     title = year = None
+    explicit_episode_num = None
 
     # Try the actual filename first...
     if filename:
-        title, year, is_series = clean_title(filename)
+        title, year, is_series, explicit_episode_num = clean_title(filename)
         if title:
-            logger.info("Trying filename-derived title: %r year=%r is_series=%r", title, year, is_series)
+            logger.info("Trying filename-derived title: %r year=%r is_series=%r episode=%r", title, year, is_series, explicit_episode_num)
             meta = search_tmdb(title, year, is_series)
 
     # ...then fall back to the caption if that didn't find anything. This
@@ -612,12 +622,16 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
     # name (e.g. "VID2024.mp4") but the actual title is written in the
     # caption instead.
     if not meta and caption_text:
-        cap_title, cap_year, cap_is_series = clean_title(caption_text)
+        cap_title, cap_year, cap_is_series, cap_ep_num = clean_title(caption_text)
         if cap_title and cap_title != title:
-            logger.info("Trying caption-derived title: %r year=%r is_series=%r", cap_title, cap_year, cap_is_series)
-            meta = search_tmdb(cap_title, cap_year, cap_is_series)
-            if meta:
-                title, year = cap_title, cap_year
+            logger.info("Trying caption-derived title: %r year=%r is_series=%r episode=%r", cap_title, cap_year, cap_is_series, cap_ep_num)
+            cap_meta = search_tmdb(cap_title, cap_year, cap_is_series)
+            if cap_meta or not title:
+                # Use the caption's title either because it found a match,
+                # or because the filename produced nothing usable at all
+                # (so caption is our only source, match or not).
+                meta = cap_meta
+                title, year, explicit_episode_num = cap_title, cap_year, cap_ep_num
 
     if not title:
         return
@@ -695,14 +709,18 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
         #    below the announcement. Reusing the file_id means Telegram
         #    just re-links the existing file — no re-uploading of bytes.
         #
-        #    Numbering is based on whether this exact title has actually
-        #    been uploaded before in this chat/topic — NOT on TMDB's
-        #    movie/TV classification, which isn't reliable enough (e.g.
-        #    TMDB lists some one-off films as "TV" in their database). A
-        #    true single upload never gets a second one, so it never gets
-        #    numbered; only a real second/third part or episode does.
+        #    Numbering prefers the ACTUAL episode number found in the
+        #    source filename/caption (e.g. "Jun Ling 8") when available —
+        #    that survives deleting and re-uploading episodes out of
+        #    order, since it's based on what the file itself says, not on
+        #    upload sequence. Falls back to our own auto-incrementing
+        #    counter only when no explicit number was found in the source.
         display_title = (meta.get("title") or meta.get("name")) if meta else title
-        episode_number = _next_episode_number(message.chat_id, thread_id, meta, title)
+        if explicit_episode_num is not None:
+            episode_number = explicit_episode_num
+            _next_episode_number(message.chat_id, thread_id, meta, title)  # keep counter in sync as a fallback baseline
+        else:
+            episode_number = _next_episode_number(message.chat_id, thread_id, meta, title)
         video_caption = f"{display_title} {episode_number}" if episode_number > 1 else display_title
         if vj_credit:
             video_caption += f"\n\n🎙️ {vj_credit}"
