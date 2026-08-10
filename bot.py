@@ -391,6 +391,21 @@ def clean_title(filename: str) -> tuple[str, str | None, bool]:
         name = re.sub(pattern, "", name, flags=re.IGNORECASE)
 
     name = re.sub(r"\s+", " ", name).strip(" -_")
+
+    # Some VJs number episodes with just a bare trailing number and no
+    # "Episode"/"S01E0X" keyword at all — e.g. "Jun Ling 1", "Jun Ling 2".
+    # If we haven't already detected a series marker, treat a small
+    # trailing number (1-2 digits) as one too: strip it so all episodes
+    # collapse to the same base title, and search TV instead of
+    # movies-only. Capped at 2 digits so it won't misfire on a movie
+    # whose real title happens to end in a big number (e.g. a year-like
+    # "2024" would already have been caught above as the year instead).
+    if not is_series:
+        trailing_num = re.search(r"\s(\d{1,2})$", name)
+        if trailing_num:
+            is_series = True
+            name = name[: trailing_num.start()].strip(" -_")
+
     return name, year, is_series
 
 
