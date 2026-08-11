@@ -836,6 +836,55 @@ async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Owner message repost — anything the owner posts (text, stickers, photos,
+# GIFs, voice, audio) gets reposted as the bot's own message and the
+# original deleted, same clean-repost pattern as movie uploads. Video and
+# document uploads from the owner are NOT handled here — those already go
+# through the full movie-processing pipeline (handle_upload) above, so
+# handling them again here would double-process the same file.
+# ---------------------------------------------------------------------------
+
+OWNER_USER_ID = os.getenv("OWNER_USER_ID")
+
+
+async def repost_owner_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.from_user:
+        return
+    if not OWNER_USER_ID or str(message.from_user.id) != str(OWNER_USER_ID):
+        return
+    if GROUP_CHAT_ID and str(message.chat_id) != str(GROUP_CHAT_ID):
+        return
+
+    chat_id = message.chat_id
+    thread_id = message.message_thread_id
+    caption = message.caption
+
+    try:
+        if message.text:
+            await context.bot.send_message(chat_id=chat_id, text=message.text, message_thread_id=thread_id)
+        elif message.sticker:
+            await context.bot.send_sticker(chat_id=chat_id, sticker=message.sticker.file_id, message_thread_id=thread_id)
+        elif message.photo:
+            await context.bot.send_photo(chat_id=chat_id, photo=message.photo[-1].file_id, caption=caption, message_thread_id=thread_id)
+        elif message.animation:
+            await context.bot.send_animation(chat_id=chat_id, animation=message.animation.file_id, caption=caption, message_thread_id=thread_id)
+        elif message.voice:
+            await context.bot.send_voice(chat_id=chat_id, voice=message.voice.file_id, caption=caption, message_thread_id=thread_id)
+        elif message.audio:
+            await context.bot.send_audio(chat_id=chat_id, audio=message.audio.file_id, caption=caption, message_thread_id=thread_id)
+        else:
+            return  # unsupported type — leave it untouched
+
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+        except Exception as e:
+            logger.warning("Could not delete owner's original message (check Delete Messages permission): %s", e)
+    except Exception as e:
+        logger.error("Failed to repost owner message: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # /request <title> — forward a request to the admin's DMs
 # ---------------------------------------------------------------------------
 
@@ -1980,6 +2029,13 @@ def main():
         logger.warning("MessageReactionHandler not available in this PTB version — reaction tracking disabled.")
     app.add_handler(
         MessageHandler((filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, handle_upload)
+    )
+    app.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.Sticker.ALL | filters.PHOTO | filters.ANIMATION | filters.VOICE | filters.AUDIO)
+            & ~filters.COMMAND,
+            repost_owner_message,
+        )
     )
 
     # Kick off the first daily announcement at a random time today (if
