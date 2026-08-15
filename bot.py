@@ -334,30 +334,52 @@ def extract_vj_credit(text: str) -> str | None:
     return "Vj " + match.group(1).title()
 
 
-def clean_title(filename: str) -> tuple[str, str | None, bool, int | None]:
-    """Extract a probable (title, year, is_series, episode_num) from a
-    release filename or caption. is_series is True only if the raw text
-    actually contains an episode/season marker (S01E02, Episode 3,
-    Season 2, or a bare trailing number...). episode_num is the actual
-    episode number found in the source when available — preferred over
-    auto-incrementing our own counter, so a deleted-and-re-uploaded
-    episode 8 still shows as "8", not whatever the next count would be."""
-    # Only look at the first non-empty line. Multi-line captions from
-    # source channels are almost always: [title line] + [promo/spam block].
+def _roman_to_int(s: str) -> int | None:
+    roman_map = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    s = s.upper()
+    if not s or any(ch not in roman_map for ch in s):
+        return None
+    total, prev = 0, 0
+    for ch in reversed(s):
+        val = roman_map[ch]
+        if val < prev:
+            total -= val
+        else:
+            total += val
+            prev = val
+    return total
+
+
+def clean_title(filename: str) -> tuple[str, str | None, bool, int | None, int | None]:
+    """Extract a probable (title, year, is_series, episode_num,
+    season_num) from a release filename or caption. is_series is True if
+    the raw text contains any episode/season marker — S01E02, Episode 3,
+    Season 2 / SN2, a bare trailing number, a trailing letter (a, b, c),
+    or a trailing Roman numeral (I, II, III...). episode_num is the
+    actual number found in the source (converted to a plain int
+    regardless of how it was written) — preferred over auto-incrementing
+    our own counter, so a deleted-and-re-uploaded episode 8 still shows
+    as "8". season_num lets episode numbering reset to 1 when a new
+    season starts, instead of continuing the previous season's count."""
     first_line = next((ln for ln in filename.splitlines() if ln.strip()), filename)
 
     episode_num = None
-    se_match = re.search(r"\bs\d{1,2}[.\s]*e(\d{1,3})\b", first_line, re.IGNORECASE)
-    ep_match = re.search(r"\b(?:episode|ep)\.?\s*(\d+)\b", first_line, re.IGNORECASE)
-    if se_match:
-        episode_num = int(se_match.group(1))
-    elif ep_match:
-        episode_num = int(ep_match.group(1))
+    season_num = None
 
-    is_series = bool(
-        se_match or ep_match
-        or re.search(r"\bseason\s*\d+\b", first_line, re.IGNORECASE)
-    )
+    se_match = re.search(r"\bs(\d{1,2})[.\s]*e(\d{1,3})\b", first_line, re.IGNORECASE)
+    ep_match = re.search(r"\b(?:episode|ep)\.?\s*(\d+)\b", first_line, re.IGNORECASE)
+    season_match = re.search(r"\b(?:season|sn)\.?\s*(\d{1,2})\b", first_line, re.IGNORECASE)
+
+    if se_match:
+        season_num = int(se_match.group(1))
+        episode_num = int(se_match.group(2))
+    else:
+        if season_match:
+            season_num = int(season_match.group(1))
+        if ep_match:
+            episode_num = int(ep_match.group(1))
+
+    is_series = bool(se_match or ep_match or season_match)
 
     # Strip a real video file extension only (avoid os.path.splitext here —
     # it would wrongly treat something like "...VJ JR.2026" as if ".2026"
@@ -386,13 +408,13 @@ def clean_title(filename: str) -> tuple[str, str | None, bool, int | None]:
     name = re.sub(r"\b(part|pt|cd|disc)\.?\s*\d+\b", "", name, flags=re.IGNORECASE)
 
     # Strip episode/season numbering (Episode 3, Ep03, S01E02, S01.E02,
-    # Season 2) so multiple episodes of the same show collapse to one
-    # title. Allow an optional space between the season and episode
+    # Season 2, SN2) so multiple episodes of the same show collapse to
+    # one title. Allow an optional space between the season and episode
     # numbers since "S01.E01" becomes "S01 E01" after dots are converted
     # to spaces above.
     name = re.sub(r"\bs\d{1,2}\s*e\d{1,3}\b", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\b(episode|ep)\.?\s*\d+\b", "", name, flags=re.IGNORECASE)
-    name = re.sub(r"\bseason\s*\d+\b", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\b(?:season|sn)\.?\s*\d{1,2}\b", "", name, flags=re.IGNORECASE)
 
     # Strip known junk tags
     for pattern in JUNK_PATTERNS:
@@ -400,22 +422,34 @@ def clean_title(filename: str) -> tuple[str, str | None, bool, int | None]:
 
     name = re.sub(r"\s+", " ", name).strip(" -_")
 
-    # Some VJs number episodes with just a bare trailing number and no
-    # "Episode"/"S01E0X" keyword at all — e.g. "Jun Ling 1", "Jun Ling 2".
-    # If we haven't already detected a series marker, treat a small
-    # trailing number (1-2 digits) as one too: strip it so all episodes
-    # collapse to the same base title, and search TV instead of
-    # movies-only. Capped at 2 digits so it won't misfire on a movie
-    # whose real title happens to end in a big number (e.g. a year-like
-    # "2024" would already have been caught above as the year instead).
-    if not is_series:
+    # If we still don't have an explicit episode number, some VJs use
+    # other conventions instead of "Episode N" — a bare trailing number
+    # ("Jun Ling 1"), a trailing letter ("Jun Ling A"), or a trailing
+    # Roman numeral ("Jun Ling III"). Check each in turn.
+    if episode_num is None:
+        roman_match = re.search(r"\s([IVXLCDM]{1,6})$", name, re.IGNORECASE)
+        if roman_match:
+            val = _roman_to_int(roman_match.group(1))
+            if val and 0 < val <= 100:
+                episode_num = val
+                is_series = True
+                name = name[: roman_match.start()].strip(" -_")
+
+    if episode_num is None:
+        letter_match = re.search(r"\s([a-zA-Z])$", name)
+        if letter_match:
+            episode_num = ord(letter_match.group(1).lower()) - ord("a") + 1
+            is_series = True
+            name = name[: letter_match.start()].strip(" -_")
+
+    if episode_num is None:
         trailing_num = re.search(r"\s(\d{1,2})$", name)
         if trailing_num:
-            is_series = True
             episode_num = int(trailing_num.group(1))
+            is_series = True
             name = name[: trailing_num.start()].strip(" -_")
 
-    return name, year, is_series, episode_num
+    return name, year, is_series, episode_num, season_num
 
 
 # ---------------------------------------------------------------------------
@@ -609,12 +643,13 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
     meta = None
     title = year = None
     explicit_episode_num = None
+    season_num = None
 
     # Try the actual filename first...
     if filename:
-        title, year, is_series, explicit_episode_num = clean_title(filename)
+        title, year, is_series, explicit_episode_num, season_num = clean_title(filename)
         if title:
-            logger.info("Trying filename-derived title: %r year=%r is_series=%r episode=%r", title, year, is_series, explicit_episode_num)
+            logger.info("Trying filename-derived title: %r year=%r is_series=%r episode=%r season=%r", title, year, is_series, explicit_episode_num, season_num)
             meta = search_tmdb(title, year, is_series)
 
     # ...then fall back to the caption if that didn't find anything. This
@@ -622,16 +657,16 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
     # name (e.g. "VID2024.mp4") but the actual title is written in the
     # caption instead.
     if not meta and caption_text:
-        cap_title, cap_year, cap_is_series, cap_ep_num = clean_title(caption_text)
+        cap_title, cap_year, cap_is_series, cap_ep_num, cap_season_num = clean_title(caption_text)
         if cap_title and cap_title != title:
-            logger.info("Trying caption-derived title: %r year=%r is_series=%r episode=%r", cap_title, cap_year, cap_is_series, cap_ep_num)
+            logger.info("Trying caption-derived title: %r year=%r is_series=%r episode=%r season=%r", cap_title, cap_year, cap_is_series, cap_ep_num, cap_season_num)
             cap_meta = search_tmdb(cap_title, cap_year, cap_is_series)
             if cap_meta or not title:
                 # Use the caption's title either because it found a match,
                 # or because the filename produced nothing usable at all
                 # (so caption is our only source, match or not).
                 meta = cap_meta
-                title, year, explicit_episode_num = cap_title, cap_year, cap_ep_num
+                title, year, explicit_episode_num, season_num = cap_title, cap_year, cap_ep_num, cap_season_num
 
     if not title:
         return
@@ -715,13 +750,24 @@ async def _process_upload(message, context: ContextTypes.DEFAULT_TYPE, file_obj)
         #    order, since it's based on what the file itself says, not on
         #    upload sequence. Falls back to our own auto-incrementing
         #    counter only when no explicit number was found in the source.
+        #    The counting key includes the season number (when known) so
+        #    a new season's first episode starts back at 1 instead of
+        #    continuing the previous season's count.
         display_title = (meta.get("title") or meta.get("name")) if meta else title
+        numbering_key = f"{title} S{season_num}" if season_num is not None else title
         if explicit_episode_num is not None:
             episode_number = explicit_episode_num
-            _next_episode_number(message.chat_id, thread_id, meta, title)  # keep counter in sync as a fallback baseline
+            _next_episode_number(message.chat_id, thread_id, meta, numbering_key)  # keep counter in sync as a fallback baseline
         else:
-            episode_number = _next_episode_number(message.chat_id, thread_id, meta, title)
-        video_caption = f"{display_title} {episode_number}" if episode_number > 1 else display_title
+            episode_number = _next_episode_number(message.chat_id, thread_id, meta, numbering_key)
+        season_label = f" S{season_num}" if season_num is not None else ""
+        # Show the number whenever we have real evidence this is an
+        # episode (an explicit episode number or season marker from the
+        # source) — even if that number is 1. Only stay silent when we're
+        # relying purely on our own auto-increment guess for what might
+        # actually be a one-off single movie.
+        show_number = season_num is not None or explicit_episode_num is not None or episode_number > 1
+        video_caption = f"{display_title}{season_label} {episode_number}" if show_number else f"{display_title}{season_label}"
         if vj_credit:
             video_caption += f"\n\n🎙️ {vj_credit}"
 
@@ -873,6 +919,8 @@ async def repost_owner_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await context.bot.send_voice(chat_id=chat_id, voice=message.voice.file_id, caption=caption, message_thread_id=thread_id)
         elif message.audio:
             await context.bot.send_audio(chat_id=chat_id, audio=message.audio.file_id, caption=caption, message_thread_id=thread_id)
+        elif message.dice:
+            await context.bot.send_dice(chat_id=chat_id, emoji=message.dice.emoji, message_thread_id=thread_id)
         else:
             return  # unsupported type — leave it untouched
 
@@ -2032,7 +2080,7 @@ def main():
     )
     app.add_handler(
         MessageHandler(
-            (filters.TEXT | filters.Sticker.ALL | filters.PHOTO | filters.ANIMATION | filters.VOICE | filters.AUDIO)
+            (filters.TEXT | filters.Sticker.ALL | filters.PHOTO | filters.ANIMATION | filters.VOICE | filters.AUDIO | filters.Dice.ALL)
             & ~filters.COMMAND,
             repost_owner_message,
         )
