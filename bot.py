@@ -1860,6 +1860,176 @@ async def post_daily_announcements(context: ContextTypes.DEFAULT_TYPE, reschedul
 
 
 # ---------------------------------------------------------------------------
+# Thriller Channel — a separate, higher-volume feed (15-25/day) for a
+# dedicated channel, completely independent of the group's General
+# Updates (different chat, different dedup, different schedule).
+# ---------------------------------------------------------------------------
+
+THRILLER_CHAT_ID = os.getenv("THRILLER_CHAT_ID")
+THRILLER_TOPIC_ID = os.getenv("THRILLER_TOPIC_ID")
+THRILLER_TOPIC_ID = int(THRILLER_TOPIC_ID) if THRILLER_TOPIC_ID else None
+THRILLER_MIN_PER_DAY = 15
+THRILLER_MAX_PER_DAY = 25
+TMDB_GENRE_THRILLER = 53
+
+TMDB_DISCOVER_BY_GENRE_URL = "https://api.themoviedb.org/3/discover/movie"
+
+
+def fetch_thriller_picks(count: int) -> list[dict]:
+    """Pull thriller movies from trending + a genre-filtered discover pool
+    (the discover pool is the main source since it can reliably supply
+    large volumes), deduped against everything already posted to the
+    Thriller Channel specifically (separate from the group's dedup)."""
+    already_announced = set(_stats.get("announced_thriller_ids", []))
+    picks, seen_ids = [], set()
+
+    # Trending, filtered down to thriller genre
+    trending = _tmdb_get(TMDB_TRENDING_URL)
+    for movie in trending:
+        if TMDB_GENRE_THRILLER in (movie.get("genre_ids") or []):
+            if movie["id"] not in seen_ids and movie["id"] not in already_announced:
+                seen_ids.add(movie["id"])
+                picks.append(movie)
+
+    # Discover pool, sorted by popularity, paged as needed to reach `count`
+    page = 1
+    while len(picks) < count and page <= 10:
+        results = _tmdb_get(
+            TMDB_DISCOVER_BY_GENRE_URL,
+            with_genres=TMDB_GENRE_THRILLER,
+            sort_by="popularity.desc",
+            page=page,
+        )
+        if not results:
+            break
+        for movie in results:
+            if movie["id"] not in seen_ids and movie["id"] not in already_announced:
+                seen_ids.add(movie["id"])
+                picks.append(movie)
+                if len(picks) >= count:
+                    break
+        page += 1
+
+    return picks[:count]
+
+
+def _mark_thriller_announced(movie_id: int) -> None:
+    announced = _stats.setdefault("announced_thriller_ids", [])
+    if movie_id not in announced:
+        announced.append(movie_id)
+    if len(announced) > 3000:
+        _stats["announced_thriller_ids"] = announced[-3000:]
+    _save_stats()
+
+
+async def _post_movie_news_batch(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """General movie news/headlines via Currents API, posted to the
+    Thriller Channel alongside the movie picks."""
+    if not THRILLER_CHAT_ID or not CURRENTS_API_KEY:
+        return
+    try:
+        resp = requests.get(
+            "https://api.currentsapi.services/v1/search",
+            headers={"Authorization": CURRENTS_API_KEY},
+            params={"keywords": "movie OR film OR Hollywood box office", "language": "en", "page_size": 5},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        articles = resp.json().get("news", [])
+    except requests.RequestException as e:
+        logger.warning("Currents API request failed (movie news): %s", e)
+        return
+
+    if not articles:
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=THRILLER_CHAT_ID,
+            text="📰🎬 *Movie News* 🎬📰",
+            message_thread_id=THRILLER_TOPIC_ID,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.error("Failed to post movie news header: %s", e)
+        return
+
+    for a in articles[:5]:
+        title = a.get("title") or "Untitled"
+        url = a.get("url") or ""
+        image = a.get("image")
+        author = a.get("author")
+        if not author or author.lower() in ("null", "none", ""):
+            try:
+                author = url.split("/")[2].replace("www.", "")
+            except IndexError:
+                author = "Unknown source"
+        caption = f"📰 *{title}*\n\n✍️ {author}\n🔗 {url}"
+        try:
+            if image and image != "None":
+                await context.bot.send_photo(
+                    chat_id=THRILLER_CHAT_ID, photo=image, caption=caption,
+                    message_thread_id=THRILLER_TOPIC_ID, parse_mode=ParseMode.MARKDOWN,
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=THRILLER_CHAT_ID, text=caption,
+                    message_thread_id=THRILLER_TOPIC_ID, parse_mode=ParseMode.MARKDOWN,
+                )
+        except Exception as e:
+            logger.warning("Failed to post one movie news article: %s", e)
+
+
+async def post_thriller_channel_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bool = True) -> None:
+    if not THRILLER_CHAT_ID:
+        logger.warning("THRILLER_CHAT_ID not set — skipping thriller channel digest.")
+        return
+
+    count = random.randint(THRILLER_MIN_PER_DAY, THRILLER_MAX_PER_DAY)
+    picks = fetch_thriller_picks(count)
+    logger.info("Thriller channel: posting %d/%d picks", len(picks), count)
+
+    for movie in picks:
+        meta = dict(movie)
+        meta["media_type"] = "movie"
+        caption, poster_url = format_announcement(meta)
+        trailer_url = fetch_trailer_url(movie["id"])
+
+        try:
+            if poster_url:
+                await context.bot.send_photo(
+                    chat_id=THRILLER_CHAT_ID, photo=poster_url, caption=caption,
+                    parse_mode=ParseMode.MARKDOWN, message_thread_id=THRILLER_TOPIC_ID,
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=THRILLER_CHAT_ID, text=caption,
+                    parse_mode=ParseMode.MARKDOWN, message_thread_id=THRILLER_TOPIC_ID,
+                )
+            if trailer_url:
+                await context.bot.send_message(
+                    chat_id=THRILLER_CHAT_ID, text=f"🎞️ Trailer: {trailer_url}",
+                    message_thread_id=THRILLER_TOPIC_ID,
+                )
+            _mark_thriller_announced(movie["id"])
+        except Exception as e:
+            logger.error("Failed to post thriller pick %s: %s", movie.get("title"), e)
+
+        await asyncio.sleep(1.5)  # gentle pacing across a large batch
+
+    await _post_movie_news_batch(context)
+
+    if reschedule:
+        context.application.job_queue.run_once(post_thriller_channel_daily, when=24 * 3600)
+
+
+async def testthriller_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Posting today's thriller batch now — this may take a few minutes for 15-25 movies...")
+    await post_thriller_channel_daily(context, reschedule=False)
+    await update.message.reply_text("Done — check the Thriller Channel.")
+
+
+# ---------------------------------------------------------------------------
 # Engagement polls — keep the topic active on quiet days, and as a fallback
 # whenever TMDB doesn't return any daily picks (e.g. the API is down).
 # ---------------------------------------------------------------------------
@@ -2071,6 +2241,7 @@ def main():
     app.add_handler(CommandHandler("request", request_cmd))
     app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
     app.add_handler(CommandHandler("testfootball", testfootball_cmd))
+    app.add_handler(CommandHandler("testthriller", testthriller_cmd))
     if MessageReactionHandler:
         app.add_handler(MessageReactionHandler(track_reaction))
     else:
@@ -2093,6 +2264,8 @@ def main():
     app.job_queue.run_once(post_engagement_poll, when=_seconds_until_first_run() + 3600)
     # Football: daily fixtures/standings/news digest, ~2 hours after startup.
     app.job_queue.run_once(post_football_daily, when=7200)
+    # Thriller Channel: independent daily digest at its own random time.
+    app.job_queue.run_once(post_thriller_channel_daily, when=_seconds_until_first_run() + 1800)
     # Football: live score checks every 15 minutes.
     app.job_queue.run_repeating(check_live_football_scores, interval=900, first=120)
     # Football: gameweek completion check every 3 hours.
