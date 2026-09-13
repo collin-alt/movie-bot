@@ -1980,6 +1980,20 @@ async def _post_movie_news_batch(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Failed to post one movie news article: %s", e)
 
 
+GROUP_PROMO_LINK = "https://t.me/+Em7t4wIx3bdjNWE0"
+GROUP_PROMO_PHRASES = [
+    "🎬 Want the FULL movie? Join our group: {link} 🍿",
+    "📥 Full movie available here: {link} 🔥",
+    "🎥 Catch the complete film in our group: {link} ✨",
+    "🍿 Full version waiting for you: {link} 🎬",
+]
+STANDALONE_PROMO_TEXTS = [
+    "🍿✨ Craving the FULL movie experience? ✨🍿\n\nJoin us here: {link}\n\nPlus — dive into our emoji & sticker library for some fun along the way! 🎉",
+    "🎬🔥 Don't just watch trailers — watch the WHOLE thing! 🔥🎬\n\n👉 {link}\n\nCome say hi with our stickers too! 😄",
+    "📽️ The full movies are just one tap away: {link}\n\n🎉 Bonus: our sticker pack is waiting for you inside!",
+]
+
+
 async def post_thriller_channel_daily(context: ContextTypes.DEFAULT_TYPE, reschedule: bool = True) -> None:
     if not THRILLER_CHAT_ID:
         logger.warning("THRILLER_CHAT_ID not set — skipping thriller channel digest.")
@@ -2007,13 +2021,36 @@ async def post_thriller_channel_daily(context: ContextTypes.DEFAULT_TYPE, resche
                     parse_mode=ParseMode.MARKDOWN, message_thread_id=THRILLER_TOPIC_ID,
                 )
             if trailer_url:
+                trailer_text = f"🎞️ Trailer: {trailer_url}"
+                # Attach the "full movie" promo to most (not all) trailer
+                # posts, so it doesn't feel like a copy-pasted line every time.
+                if random.random() < 0.85:
+                    trailer_text += "\n\n" + random.choice(GROUP_PROMO_PHRASES).format(link=GROUP_PROMO_LINK)
                 await context.bot.send_message(
-                    chat_id=THRILLER_CHAT_ID, text=f"🎞️ Trailer: {trailer_url}",
+                    chat_id=THRILLER_CHAT_ID, text=trailer_text,
                     message_thread_id=THRILLER_TOPIC_ID,
                 )
             _mark_thriller_announced(movie["id"])
         except Exception as e:
             logger.error("Failed to post thriller pick %s: %s", movie.get("title"), e)
+
+        # Occasionally post the promo as its own standalone message, with
+        # one of the fun stickers, rather than attached to a movie.
+        if random.random() < 0.12:
+            try:
+                await context.bot.send_message(
+                    chat_id=THRILLER_CHAT_ID,
+                    text=random.choice(STANDALONE_PROMO_TEXTS).format(link=GROUP_PROMO_LINK),
+                    message_thread_id=THRILLER_TOPIC_ID,
+                )
+                sticker_path = _random_sticker_path()
+                if sticker_path:
+                    with open(sticker_path, "rb") as f:
+                        await context.bot.send_sticker(
+                            chat_id=THRILLER_CHAT_ID, sticker=f, message_thread_id=THRILLER_TOPIC_ID,
+                        )
+            except Exception as e:
+                logger.warning("Failed to post standalone promo: %s", e)
 
         await asyncio.sleep(1.5)  # gentle pacing across a large batch
 
